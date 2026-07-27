@@ -1,13 +1,12 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
+
+from conftest import make_urge
 
 from ambientwill.engine import Engine
 from ambientwill.models import Decision
 
-from conftest import make_urge
-
-
-NOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
 
 def test_sleep_reflect_and_message_decisions(store, policy) -> None:
@@ -78,4 +77,19 @@ def test_same_idempotency_key_does_not_duplicate_outbox(store, policy) -> None:
     engine.tick(at=NOW)
 
     assert store.count_outbox() == 1
+    assert store.count_wake_events() == 1
+
+
+def test_equivalent_offset_timestamps_are_one_idempotent_tick(store, policy) -> None:
+    store.add_urge(make_urge(urgency=0.4, confidence=0.4, interruption_cost=0.1))
+    engine = Engine(policy, store)
+
+    first = engine.tick(at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+    second = engine.tick(
+        at=datetime(2026, 1, 1, 13, 0, tzinfo=timezone(timedelta(hours=1)))
+    )
+
+    assert first.decision is Decision.REFLECT
+    assert second.decision is Decision.SLEEP
+    assert second.blocked_by == "idempotency_key"
     assert store.count_wake_events() == 1

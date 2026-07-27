@@ -5,9 +5,9 @@ import random
 import sqlite3
 import uuid
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from ambientwill.gates import evaluate_pre_urge_gates
+from ambientwill.gates import evaluate_pre_urge_gates, in_quiet_hours
 from ambientwill.models import (
     AgentPolicy,
     Decision,
@@ -52,16 +52,29 @@ class Engine:
         dry_run: bool = False,
         fail_after_wake: bool = False,
     ) -> TickResult:
-        evaluated_at = at or datetime.now(timezone.utc)
+        evaluated_at = at or datetime.now(UTC)
         if evaluated_at.tzinfo is None:
             raise ValueError("tick time must include a timezone")
 
         lock = nullcontext() if dry_run else TickLock(self.storage.lock_path)
         try:
             with lock:
+                if not dry_run and self.storage.wake_seen(trigger, evaluated_at):
+                    return TickResult(
+                        decision=Decision.SLEEP,
+                        reasons=[
+                            _reason(
+                                "idempotency_key",
+                                False,
+                                "this trigger and evaluation time were already recorded",
+                            )
+                        ],
+                        blocked_by="idempotency_key",
+                    )
                 result, urge = self._evaluate(evaluated_at)
                 result.dry_run = dry_run
                 if dry_run:
+                    self._apply_delay_gates(result, urge, evaluated_at)
                     return result
                 return self._commit(
                     result,
@@ -113,17 +126,24 @@ class Engine:
             )
         reasons.append(_reason("valid_urge", True, count=len(urges)))
 
-        selected = max(urges, key=lambda urge: (urge.score, -urge.created_at.timestamp()))
-        score = selected.score
-        if self.storage.cooldown_seen_since(
-            selected.cooldown_key, at - self.policy.cooldown
-        ):
+        eligible = [
+            urge
+            for urge in urges
+            if not self.storage.cooldown_seen_since(
+                urge.cooldown_key, at - self.policy.cooldown
+            )
+        ]
+        if not eligible:
+            selected = max(
+                urges, key=lambda urge: (urge.score, -urge.created_at.timestamp())
+            )
             reasons.append(
                 _reason(
                     "cooldown_key",
                     False,
                     key=selected.cooldown_key,
                     cooldown_seconds=int(self.policy.cooldown.total_seconds()),
+                    excluded=len(urges),
                 )
             )
             return (
@@ -131,12 +151,23 @@ class Engine:
                     decision=Decision.SLEEP,
                     reasons=reasons,
                     selected_urge_id=selected.id,
-                    score=score,
+                    score=selected.score,
                     blocked_by="cooldown_key",
                 ),
                 selected,
             )
-        reasons.append(_reason("cooldown_key", True, key=selected.cooldown_key))
+        selected = max(
+            eligible, key=lambda urge: (urge.score, -urge.created_at.timestamp())
+        )
+        score = selected.score
+        reasons.append(
+            _reason(
+                "cooldown_key",
+                True,
+                key=selected.cooldown_key,
+                excluded=len(urges) - len(eligible),
+            )
+        )
 
         if score >= self.policy.message_threshold:
             decision = Decision.MESSAGE_PLANNED
@@ -185,6 +216,85 @@ class Engine:
             selected,
         )
 
+    def _apply_delay_gates(
+        self, result: TickResult, urge: Urge | None, at: datetime
+    ) -> datetime | None:
+        if result.decision is not Decision.MESSAGE_PLANNED or urge is None:
+            return None
+        jitter = self.rng.randint(
+            self.policy.jitter_min_minutes,
+            self.policy.jitter_max_minutes,
+        )
+        delayed_until = at + timedelta(minutes=jitter)
+        if in_quiet_hours(delayed_until, self.policy.quiet_hours, self.policy.zone):
+            result.decision = Decision.SLEEP
+            result.blocked_by = "delayed_into_quiet_hours"
+            result.reasons.append(
+                _reason(
+                    "delayed_quiet_hours",
+                    False,
+                    "jitter landed inside a quiet window",
+                    delayed_until=delayed_until.isoformat(),
+                )
+            )
+            return None
+
+        last_message = self.storage.last_message_time()
+        if (
+            last_message is not None
+            and delayed_until - last_message < self.policy.min_message_gap
+        ):
+            result.decision = Decision.SLEEP
+            result.blocked_by = "delayed_minimum_message_gap"
+            result.reasons.append(
+                _reason(
+                    "delayed_minimum_message_gap",
+                    False,
+                    "the delayed plan would violate the minimum message gap",
+                    last_message_at=last_message.isoformat(),
+                    delayed_until=delayed_until.isoformat(),
+                    required_seconds=int(self.policy.min_message_gap.total_seconds()),
+                )
+            )
+            return None
+        result.reasons.append(
+            _reason(
+                "delayed_minimum_message_gap",
+                True,
+                last_message_at=last_message.isoformat() if last_message else None,
+                delayed_until=delayed_until.isoformat(),
+                required_seconds=int(self.policy.min_message_gap.total_seconds()),
+            )
+        )
+
+        daily_count = self.storage.daily_message_count(delayed_until, self.policy.zone)
+        if daily_count >= self.policy.daily_message_hard_limit:
+            result.decision = Decision.SLEEP
+            result.blocked_by = "daily_message_hard_limit"
+            result.reasons.append(
+                _reason(
+                    "daily_message_hard_limit",
+                    False,
+                    "the delayed local day has no remaining message budget",
+                    value=daily_count,
+                    limit=self.policy.daily_message_hard_limit,
+                    delayed_until=delayed_until.isoformat(),
+                )
+            )
+            return None
+
+        result.reasons.append(
+            _reason(
+                "daily_message_hard_limit",
+                True,
+                value=daily_count,
+                limit=self.policy.daily_message_hard_limit,
+                delayed_until=delayed_until.isoformat(),
+            )
+        )
+        result.delayed_until = delayed_until
+        return delayed_until
+
     def _commit(
         self,
         result: TickResult,
@@ -195,24 +305,14 @@ class Engine:
         fail_after_wake: bool,
     ) -> TickResult:
         wake_id = f"aw_wake_{uuid.uuid4().hex}"
-        wake = WakeEvent(
-            id=wake_id,
-            trigger=trigger,
-            evaluated_at=at,
-            selected_urge_id=result.selected_urge_id,
-            decision=result.decision,
-            reasons=result.reasons,
-            created_at=at,
-        )
-
         outbox: OutboxEvent | None = None
-        if result.decision is Decision.MESSAGE_PLANNED and urge is not None:
-            jitter = self.rng.randint(
-                self.policy.jitter_min_minutes,
-                self.policy.jitter_max_minutes,
-            )
-            delayed_until = at + timedelta(minutes=jitter)
-            raw_key = f"{urge.id}|{urge.cooldown_key}|{at.isoformat()}"
+        delayed_until = self._apply_delay_gates(result, urge, at)
+        if (
+            result.decision is Decision.MESSAGE_PLANNED
+            and urge is not None
+            and delayed_until is not None
+        ):
+            raw_key = f"{urge.id}|{urge.cooldown_key}"
             idempotency_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
             event_id = f"aw_out_{uuid.uuid4().hex}"
             outbox = OutboxEvent(
@@ -226,10 +326,19 @@ class Engine:
                 cooldown_key=urge.cooldown_key,
             )
             result.outbox_event_id = event_id
-            result.delayed_until = delayed_until
+
+        wake = WakeEvent(
+            id=wake_id,
+            trigger=trigger,
+            evaluated_at=at,
+            selected_urge_id=result.selected_urge_id,
+            decision=result.decision,
+            reasons=result.reasons,
+            created_at=at,
+        )
 
         try:
-            outbox_inserted = self.storage.record_decision(
+            outbox_inserted = self.storage._record_decision_unlocked(
                 wake,
                 outbox,
                 fail_after_wake=fail_after_wake,
@@ -253,14 +362,18 @@ class Engine:
 
         result.wake_event_id = wake_id
         if outbox is not None and not outbox_inserted:
-            result.wake_event_id = None
-            result.outbox_event_id = None
-            result.delayed_until = None
-            result.reasons.append(
-                _reason(
-                    "idempotency_key",
-                    False,
-                    "an equivalent shadow outbox event already exists",
-                )
+            return TickResult(
+                decision=Decision.SLEEP,
+                reasons=result.reasons
+                + [
+                    _reason(
+                        "idempotency_key",
+                        False,
+                        "an equivalent shadow outbox event already exists",
+                    )
+                ],
+                selected_urge_id=result.selected_urge_id,
+                score=result.score,
+                blocked_by="idempotency_key",
             )
         return result

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,7 @@ def make_urge(
     created_at: datetime | None = None,
     expires_at: datetime | None = None,
 ) -> Urge:
-    created = created_at or datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+    created = created_at or datetime(2026, 1, 1, 1, 0, tzinfo=UTC)
     return Urge(
         id=urge_id,
         type="follow_up",

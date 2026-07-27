@@ -1,17 +1,23 @@
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-
-from ambientwill.engine import Engine
-from ambientwill.models import QuietWindow
+from datetime import UTC, datetime, timedelta, timezone
 
 from conftest import make_urge
 
+from ambientwill.engine import Engine
 
-NOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
 
-def _message(store, policy, urge_id: str, at: datetime, cooldown_key: str = "key") -> None:
-    store.add_urge(make_urge(urge_id=urge_id, created_at=at - timedelta(minutes=1), cooldown_key=cooldown_key))
+def _message(
+    store, policy, urge_id: str, at: datetime, cooldown_key: str = "key"
+) -> None:
+    store.add_urge(
+        make_urge(
+            urge_id=urge_id,
+            created_at=at - timedelta(minutes=1),
+            cooldown_key=cooldown_key,
+        )
+    )
     result = Engine(policy, store).tick(at=at)
     assert result.decision.value == "MESSAGE_PLANNED"
     store.set_urge_status(urge_id, "closed")
@@ -34,9 +40,10 @@ def test_daily_hard_limit_uses_local_natural_day(store, policy) -> None:
     result = Engine(limited, store).tick(at=NOW + timedelta(hours=1), dry_run=True)
 
     assert result.blocked_by == "daily_message_hard_limit"
-    assert Engine(limited, store).tick(
-        at=NOW + timedelta(days=1), dry_run=True
-    ).blocked_by != "daily_message_hard_limit"
+    assert (
+        Engine(limited, store).tick(at=NOW + timedelta(days=1), dry_run=True).blocked_by
+        != "daily_message_hard_limit"
+    )
 
 
 def test_unanswered_limit(store, policy) -> None:
@@ -84,9 +91,7 @@ def test_cooldown_key_blocks_repeated_intent(store, policy) -> None:
 
 
 def test_score_threshold_is_explained(store, policy) -> None:
-    store.add_urge(
-        make_urge(urgency=0.1, confidence=0.1, interruption_cost=0.1)
-    )
+    store.add_urge(make_urge(urgency=0.1, confidence=0.1, interruption_cost=0.1))
 
     result = Engine(replace(policy, quiet_hours=()), store).tick(at=NOW, dry_run=True)
 

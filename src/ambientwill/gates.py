@@ -12,7 +12,7 @@ class GateStorage(Protocol):
 
     def daily_message_count(self, at: datetime, zone: ZoneInfo) -> int: ...
 
-    def unanswered_count(self) -> int: ...
+    def unanswered_count(self, at: datetime) -> int: ...
 
     def last_message_time(self) -> datetime | None: ...
 
@@ -67,27 +67,7 @@ def evaluate_pre_urge_gates(
         return reasons, "quiet_hours"
     reasons.append({"gate": "quiet_hours", "passed": True})
 
-    daily_count = storage.daily_message_count(at, policy.zone)
-    if daily_count >= policy.daily_message_hard_limit:
-        reasons.append(
-            {
-                "gate": "daily_message_hard_limit",
-                "passed": False,
-                "value": daily_count,
-                "limit": policy.daily_message_hard_limit,
-            }
-        )
-        return reasons, "daily_message_hard_limit"
-    reasons.append(
-        {
-            "gate": "daily_message_hard_limit",
-            "passed": True,
-            "value": daily_count,
-            "limit": policy.daily_message_hard_limit,
-        }
-    )
-
-    unanswered = storage.unanswered_count()
+    unanswered = storage.unanswered_count(at)
     if unanswered >= policy.unanswered_limit:
         reasons.append(
             {
@@ -108,10 +88,7 @@ def evaluate_pre_urge_gates(
     )
 
     last_message = storage.last_message_time()
-    if (
-        last_message is not None
-        and at - last_message < policy.min_message_gap
-    ):
+    if last_message is not None and at - last_message < policy.min_message_gap:
         reasons.append(
             {
                 "gate": "min_message_gap",

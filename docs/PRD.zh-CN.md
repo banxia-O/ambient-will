@@ -687,11 +687,11 @@ ambientwill doctor
 
 所有模拟和 dry-run 都不得发送消息或执行外部动作。
 
-## 17. 首个宿主适配器：Hermes Agent
+## 17. 未来首个宿主适配器：Hermes Agent
 
-AmbientWill 核心保持框架无关，但首个官方 adapter 面向 Hermes Agent。
+AmbientWill 核心保持框架无关；离线 shadow replay 独立验收通过后，未来首个官方 adapter 才考虑面向 Hermes Agent。
 
-v0.1 采用“独立 sidecar + 极薄 Hermes adapter”，不把核心循环做进 gateway 进程。adapter 只负责读取必要上下文、投递消息和提供事件摘要；不得修改 Hermes 核心代码、`state.db`、memory、HEART、skill、cron 定义或全局配置。
+v0.1 只有独立、离线、单次退出的 Shadow Core，不包含任何 Hermes adapter。未来 adapter 仍必须保持极薄，不把核心循环做进 gateway 进程；只负责经授权读取必要上下文、投递消息和提供事件摘要，且不得修改 Hermes 核心代码、`state.db`、memory、HEART、skill、cron 定义或全局配置。
 
 Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；AmbientWill 不复制其职责，也不把自己的反馈账本自动喂给这些系统。
 
@@ -709,22 +709,23 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 
 ## 18. MVP 范围
 
-### v0.1：Message-only Safe Loop
+### v0.1：Offline Shadow Core
 
 - SQLite 事件账本；
 - 配置化静默窗口、预算、冷却和随机延迟；
-- 读取最近会话；
 - Urge 最小模型；Thought 与 Desire 仅保留概念和扩展接口，不在 v0.1 实现长期自主进化；
-- `SLEEP / REFLECT / MESSAGE` 三种决策；
-- 最多 L2 权限，不执行宿主写操作；
-- 主动消息 Outbox；
-- 最近主动消息去重；
-- 回复后的 Context Bridge；
+- `SLEEP / REFLECT / MESSAGE_PLANNED` 三种决策；
+- 仅本地 L0/L1 影子权限，不读取或写入宿主；
+- 影子 Outbox，不真实投递；
+- 稳定幂等键与 Urge 原子消费；
+- 仅用于回放的本地 feedback marker，不接真实回复；
 - dry-run、simulate、status、pause、why；
 - 跨进程锁、幂等和故障收缩；
 - 匿名回放测试。
 - 不接入自动修复、skill 进化、记忆挖掘或向量化链路；
 - AmbientWill 停机后，宿主全部核心功能继续正常运行。
+
+读取最近会话、Context Bridge、真实 Outbox 投递和 Hermes adapter 均不属于 v0.1；这些能力必须在离线 shadow replay 通过后另行设计、审查和授权。
 
 ### v0.2：Adaptive Presence
 
@@ -754,88 +755,71 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 
 ## 19. 验收标准
 
-### 时间与静默
+### v0.1 Offline Shadow Core
+
+#### 时间、静默与预算
 
 - 所有区间遵守配置时区和左闭右开定义；
-- 静默窗口内普通主动消息发送数为 0；
-- 临时静音立即生效；
-- 随机延迟后若用户已发言，原消息会取消或重评估。
+- 静默窗口内不产生普通 `MESSAGE_PLANNED` Outbox；
+- jitter 后以 `delayed_until` 重新检查静默窗口、本地自然日预算和最小间隔；
+- 临时静音对后续 Tick 立即生效；
+- 每日普通主动消息硬上限、连续未回应上限和 cooldown 均能解释且不可绕过；
+- feedback marker 只确认已经到达计划时点的历史 Outbox，不确认未来计划。
 
-### 预算与退避
+#### 状态与幂等
 
-- 超过每日上限不调用消息生成模型；
-- 达到连续未确认上限后停止主动消息；
-- 同一 cooldown key 不重复触发；
-- 多进程并发 Tick 只产生一次运行。
+- 每次 WakeEvent 和 Shadow Outbox 都有唯一 ID；
+- 同一绝对评估时刻的等价时区表示只记录一次 Tick；
+- 同一 idempotency key 最多形成一条 Shadow Outbox；
+- `MESSAGE_PLANNED` 与对应 Urge 关闭在同一 SQLite 事务中；
+- Agent 能通过 `why` 说明上次为何醒来、沉默、反思或计划消息。
 
-### 连续性
+#### 安全与隔离
 
-- 每次 WakeEvent 和 ProactiveEvent 都有唯一 ID；
-- 用户下一次回复时，主会话能获得相关主动事件摘要；
-- 不向宿主 canonical session 写伪造历史；
-- Agent 能说明上次为何主动出现。
+- v0.1 不联网、不调用 LLM、不投递真实消息；
+- 不读取或写入 Hermes session、memory、skill、cron、配置或 `state.db`；
+- 不提供终端执行、支付、发布、自动修复和自我进化能力；
+- 所有写命令使用同一跨进程项目锁，锁冲突时失败收缩为 `SLEEP`；
+- dry-run、simulate、status、events 和 why 不修改源数据目录；
+- 数据目录、数据库和锁使用私有权限，并拒绝 symlink 路径逃逸；
+- 日志和公开仓库不记录密钥、完整私人聊天或不必要 PII。
 
-### 安全
+#### 质量
 
-- v0.1 没有终端写入、支付、发布和配置修改权限；
-- 外部网页内容不能改变权限策略；
-- 模型输出无法绕过 capability gate；
-- 投递未知时不会无限重发；
-- 日志不记录密钥、完整私人聊天或不必要 PII。
+- 查询失败、数据库损坏和无效输入默认失败收缩；
+- `--json` 在参数解析和运行时错误中都保持结构化输出；
+- dry-run 能解释每个门控结果；
+- 一周匿名 shadow replay 中无重复计划和静默时段违规。
 
-### 质量
+### 未来真实适配器验收（不属于 v0.1）
 
-- 主动消息默认不超过三句话；
-- 最近三条消息不存在明显模板复读；
-- 查询失败默认静默；
-- dry-run 能完整解释每个门控结果；
-- 一周回放测试中无重复投递和静默时段违规。
+以下能力必须在 Shadow Core 独立验收通过后另立阶段：用户发言后取消或重评估、消息生成模型、Context Bridge、网页输入 capability gate、真实投递状态机、平台回执和主动事件摘要注入主会话。
 
 ## 20. 测试策略
 
-### 单元测试
+### v0.1 单元与边界测试
 
-- 时间区间边界、跨日和时区；
-- daily count、unanswered、cooldown、jitter；
-- Urge 合并、衰减、过期和评分；
-- 权限 Gate；
-- Outbox 幂等状态机；
-- Context Bridge 关联窗口；
-- 反馈退避。
+- 时间区间边界、跨午夜、时区和等价 offset；
+- daily count、unanswered、feedback marker、cooldown、jitter；
+- Urge 过期、评分、消费和事务回滚；
+- Shadow Outbox 幂等与 WakeEvent Tick 幂等；
+- NaN、inf、bool 冒充数字和非整数配置；
+- lock、数据库及嵌套祖先 symlink；
+- 参数解析 JSON 错误和数据库故障 JSON。
 
-### 属性测试
+### 并发、属性与故障注入
 
+- 多进程 Tick 只产生一次运行；
+- pause、resume、urge-add、feedback-record 和 init 使用同一项目锁；
 - 任意时间输入都只能落入一个最高优先级时段；
-- 静默时段永不产生普通 MESSAGE；
-- 同一 idempotency key 最多 delivered 一次；
-- 权限等级不会因模型文本提高；
-- 计数器在本地自然日边界正确归零。
+- 静默时段永不产生普通 `MESSAGE_PLANNED`；
+- 计数器在本地自然日边界正确归属；
+- WAL 活跃时只读快照保留已提交数据且不修改源目录；
+- SQLite 锁冲突、事务中断、数据库损坏、系统时间跳变和重复 Tick 均失败收缩。
 
-### 回放测试
+### Shadow replay
 
-使用匿名对话 fixture 回放：
-
-- 高频聊天后不应主动打扰；
-- 用户长时间离线但无 Urge 时保持沉默；
-- 有未完成承诺时形成跟进 Urge；
-- 连续两次未回应后退避；
-- 用户回复主动消息后恢复上下文；
-- cron 运行中重启，消息不重复发送。
-
-### 故障注入
-
-- session 查询失败；
-- SQLite 锁冲突；
-- 模型超时或输出非法结构；
-- 网关返回成功但实际未确认；
-- 投递后进程崩溃；
-- 系统时间跳变；
-- 重复 webhook；
-- 外部内容包含 prompt injection。
-
-### 真实验收
-
-在测试渠道至少运行一周 shadow mode：系统只记录“本来会做什么”，不实际发送。人工审核误触发、漏触发、重复主题和权限决策后，再逐步开放真实投递。
+使用匿名 fixture 回放一周候选事件，检查沉默率、误触发、漏触发、重复主题、预算归属和权限决策。该阶段只记录“本来会做什么”，不实际发送；通过人工审核后，才能另行设计真实适配器。
 
 ## 21. 产品指标
 
@@ -901,30 +885,26 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 
 ## 23. 开放问题
 
-以下问题留待 PRD 迭代决定：
+以下问题留待后续阶段决定：
 
-- v0.1 的默认 Tick 频率是一小时、两小时，还是事件优先＋低频兜底？
-- Companion preset 是否默认开启固定问候窗口？
-- 普通主动消息默认每天 1 条还是 2 条？
-- “未回应”观察窗口多长，如何避免把忙碌误判成负反馈？
-- Agent 能否自主创建 Desire，还是只能提出候选等待批准？
+- Shadow Core 通过一周回放后，候选唤醒应由事件源、低频调度还是二者组合提供？
+- Companion preset 是否开启固定问候窗口？
+- “未回应”在真实适配器中如何由平台回复可靠确认？
+- Thought 与 Desire 何时只作为候选输入，何时允许进入更长周期状态？
 - 情绪状态只影响表达，还是可以影响 Urge 强度？
-- 用户回复与 ProactiveEvent 的关联采用时间窗口、语义判断，还是平台 metadata？
+- 用户回复与主动事件的关联采用时间窗口、语义判断，还是平台 metadata？
 - Hermes 是否已有可验证的原生 session attachment，可否替代部分 Context Bridge？
 - thin adapter 采用 Hermes plugin 还是 gateway hook；Core Engine 固定为独立 sidecar，不进入 gateway 主进程；
-- SQLite schema 是否公开稳定，还是先标记 internal？
-- 开源许可证选 MIT 还是 Apache-2.0？
-- 是否提供完全不调用 LLM 的 deterministic preset？
+- SQLite schema 何时从 internal 升级为稳定公开契约？
 
-## 24. 建议的下一轮 PRD 讨论顺序
+## 24. 建议的下一轮讨论顺序
 
-1. 先定最小体验：一次候选唤醒到底如何从“无事”走到“值得说”；
-2. 再定默认打扰预算与静默策略；
-3. 明确 Thought、Desire、Urge 三者是否都进入 v0.1；
-4. 定 Context Bridge 在 Hermes 上的真实实现边界；
-5. 定 v0.1 的权限只到 L2，避免过早加入自主执行；
-6. 用匿名历史做 shadow replay，反推阈值，而不是凭感觉写死；
-7. PRD 稳定后，再生成交给编码 Agent 的架构设计与分阶段实施计划。
+1. 先冻结并独立验收 v0.1 Offline Shadow Core；
+2. 用匿名历史做一周 shadow replay，反推阈值而不是凭感觉写死；
+3. 评估误触发、漏触发、重复主题、预算和沉默率；
+4. 再设计只读 Context Bridge 与候选唤醒输入，保持宿主单向隔离；
+5. 明确真实投递的 capability gate、回执、撤销和限频；
+6. 最后才选择 Hermes thin adapter 形态，并另立 PRD、授权和验收。
 
 ## 25. 一句话总结
 

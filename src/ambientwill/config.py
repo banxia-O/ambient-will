@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tomllib
 from datetime import timedelta
 from pathlib import Path
@@ -33,6 +34,15 @@ def _require_number(table: dict[str, Any], key: str) -> int | float:
     value = table.get(key)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"agent.{key} must be a number")
+    if not math.isfinite(float(value)):
+        raise ConfigError(f"agent.{key} must be finite")
+    return value
+
+
+def _require_integer(table: dict[str, Any], key: str) -> int:
+    value = table.get(key)
+    if type(value) is not int:
+        raise ConfigError(f"agent.{key} must be an integer")
     return value
 
 
@@ -77,28 +87,20 @@ def load_policy(path: str | Path) -> AgentPolicy:
         policy = AgentPolicy(
             timezone=timezone,
             quiet_hours=tuple(windows),
-            daily_message_hard_limit=int(
-                _require_number(agent, "daily_message_hard_limit")
+            daily_message_hard_limit=_require_integer(
+                agent, "daily_message_hard_limit"
             ),
-            unanswered_limit=int(_require_number(agent, "unanswered_limit")),
+            unanswered_limit=_require_integer(agent, "unanswered_limit"),
             min_message_gap=timedelta(
                 minutes=float(_require_number(agent, "min_message_gap_minutes"))
             ),
-            jitter_min_minutes=int(
-                _require_number(agent, "jitter_min_minutes")
-            ),
-            jitter_max_minutes=int(
-                _require_number(agent, "jitter_max_minutes")
-            ),
+            jitter_min_minutes=_require_integer(agent, "jitter_min_minutes"),
+            jitter_max_minutes=_require_integer(agent, "jitter_max_minutes"),
             cooldown=timedelta(
                 minutes=float(_require_number(agent, "cooldown_minutes"))
             ),
-            message_threshold=float(
-                _require_number(agent, "message_threshold")
-            ),
-            reflect_threshold=float(
-                _require_number(agent, "reflect_threshold")
-            ),
+            message_threshold=float(_require_number(agent, "message_threshold")),
+            reflect_threshold=float(_require_number(agent, "reflect_threshold")),
         )
     except (ValidationError, OverflowError, ValueError) as exc:
         raise ConfigError(str(exc)) from exc

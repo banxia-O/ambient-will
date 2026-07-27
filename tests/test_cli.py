@@ -8,7 +8,9 @@ def test_init_config_check_and_json_output(tmp_path: Path, capsys) -> None:
     config = tmp_path / "ambientwill.toml"
     data = tmp_path / "data"
 
-    assert main(["init", "--config", str(config), "--data-dir", str(data), "--json"]) == 0
+    assert (
+        main(["init", "--config", str(config), "--data-dir", str(data), "--json"]) == 0
+    )
     init_payload = json.loads(capsys.readouterr().out)
     assert init_payload["ok"] is True
 
@@ -17,7 +19,9 @@ def test_init_config_check_and_json_output(tmp_path: Path, capsys) -> None:
     assert check_payload["ok"] is True
 
 
-def test_urge_add_tick_dry_run_and_simulate_do_not_write(tmp_path: Path, capsys) -> None:
+def test_urge_add_tick_dry_run_and_simulate_do_not_write(
+    tmp_path: Path, capsys
+) -> None:
     config = tmp_path / "ambientwill.toml"
     data = tmp_path / "data"
     main(["init", "--config", str(config), "--data-dir", str(data), "--json"])
@@ -48,7 +52,20 @@ def test_urge_add_tick_dry_run_and_simulate_do_not_write(tmp_path: Path, capsys)
     )
     capsys.readouterr()
 
-    assert main(["tick", "--config", str(config), "--data-dir", str(data), "--dry-run", "--json"]) == 0
+    assert (
+        main(
+            [
+                "tick",
+                "--config",
+                str(config),
+                "--data-dir",
+                str(data),
+                "--dry-run",
+                "--json",
+            ]
+        )
+        == 0
+    )
     json.loads(capsys.readouterr().out)
 
     assert (
@@ -119,3 +136,16 @@ reflect_threshold = 0.5
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert not (data / "ambientwill.db-wal").exists()
+
+
+def test_argparse_errors_are_json_when_requested(capsys) -> None:
+    assert main(["tick", "--json", "--bogus"]) == 2
+    unknown = json.loads(capsys.readouterr().out)
+    assert unknown["ok"] is False
+    assert unknown["decision"] == "SLEEP"
+    assert unknown["error"] == "argument_error"
+
+    assert main(["simulate", "--json"]) == 2
+    missing = json.loads(capsys.readouterr().out)
+    assert missing["ok"] is False
+    assert missing["blocked_by"] == "argument_error"

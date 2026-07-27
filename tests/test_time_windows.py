@@ -4,7 +4,6 @@ from zoneinfo import ZoneInfo
 from ambientwill.gates import in_quiet_hours
 from ambientwill.models import QuietWindow
 
-
 SGT = ZoneInfo("Asia/Singapore")
 
 

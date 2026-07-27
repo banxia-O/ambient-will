@@ -76,6 +76,18 @@ Inspect the latest committed decision:
 ambientwill why --data-dir ./data --json
 ```
 
+For an offline shadow replay, record a simulated user response locally:
+
+```bash
+ambientwill feedback-record \
+  --data-dir ./data \
+  --at "2026-01-01T12:00:00+08:00" \
+  --json
+```
+
+This command only advances a local `last_feedback_at` marker. It is test input,
+not a reply bridge, and it never reads a host conversation.
+
 Every command that returns structured data supports `--json`.
 
 ## Decision loop
@@ -83,16 +95,24 @@ Every command that returns structured data supports `--json`.
 Each normal Tick:
 
 1. reads the local policy and ledger;
-2. applies pause, quiet-hours, daily-limit, unanswered-limit, and minimum-gap
-   gates in a fixed order;
-3. selects the highest scoring valid Urge;
-4. applies the Urge cooldown;
-5. calculates `urgency + confidence - interruption_cost`;
-6. records one WakeEvent and, for `MESSAGE_PLANNED`, one atomic shadow Outbox
-   event.
+2. applies pause, quiet-hours, unanswered-limit, and minimum-gap gates;
+3. removes Urges whose cooldown key is still active, then selects the highest
+   scoring eligible Urge;
+4. calculates `urgency + confidence - interruption_cost`;
+5. applies jitter, then re-checks quiet hours and the local-day message budget
+   at `delayed_until`;
+6. records one WakeEvent and, for `MESSAGE_PLANNED`, atomically records one
+   shadow Outbox event and closes the selected Urge.
 
 Time windows use the configured IANA timezone and left-closed, right-open
-semantics. Cross-midnight windows are supported.
+semantics. Cross-midnight windows are supported. Quiet-hour clocks must use
+strict `HH:MM` format.
+
+New data directories are created with mode `0700`; the SQLite database and
+project lock use `0600`. Writable operations refuse database or directory
+symlinks and refuse existing data directories that are accessible by group or
+others. Read-only commands copy the SQLite/WAL state into an in-memory snapshot
+before querying, so they do not modify the selected data directory.
 
 ## Development
 

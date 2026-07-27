@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from enum import Enum
@@ -17,6 +19,8 @@ def _validate_unit_interval(name: str, value: float) -> None:
 
 
 def parse_clock(value: str) -> time:
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) is None:
+        raise ValidationError("quiet-hour clocks must use strict local HH:MM values")
     try:
         parsed = time.fromisoformat(value)
     except ValueError as exc:
@@ -32,9 +36,9 @@ class QuietWindow:
     end: str
 
     def __post_init__(self) -> None:
-        parse_clock(self.start)
-        parse_clock(self.end)
-        if self.start == self.end:
+        start = parse_clock(self.start)
+        end = parse_clock(self.end)
+        if start == end:
             raise ValidationError("quiet-hour start and end cannot be equal")
 
     def to_dict(self) -> dict[str, str]:
@@ -59,6 +63,14 @@ class AgentPolicy:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
             raise ValidationError(f"unknown timezone: {self.timezone}") from exc
+        if type(self.daily_message_hard_limit) is not int:
+            raise ValidationError("daily_message_hard_limit must be an integer")
+        if type(self.unanswered_limit) is not int:
+            raise ValidationError("unanswered_limit must be an integer")
+        if type(self.jitter_min_minutes) is not int:
+            raise ValidationError("jitter_min_minutes must be an integer")
+        if type(self.jitter_max_minutes) is not int:
+            raise ValidationError("jitter_max_minutes must be an integer")
         if self.daily_message_hard_limit < 0:
             raise ValidationError("daily_message_hard_limit must be non-negative")
         if self.unanswered_limit < 0:
@@ -73,10 +85,16 @@ class AgentPolicy:
             raise ValidationError(
                 "jitter_max_minutes must be at least jitter_min_minutes"
             )
+        for name, value in (
+            ("message_threshold", self.message_threshold),
+            ("reflect_threshold", self.reflect_threshold),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValidationError(f"{name} must be a number")
+            if not math.isfinite(float(value)) or not -1.0 <= float(value) <= 2.0:
+                raise ValidationError(f"{name} must be finite and between -1.0 and 2.0")
         if self.reflect_threshold > self.message_threshold:
-            raise ValidationError(
-                "reflect_threshold cannot exceed message_threshold"
-            )
+            raise ValidationError("reflect_threshold cannot exceed message_threshold")
 
     @property
     def zone(self) -> ZoneInfo:

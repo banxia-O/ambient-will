@@ -1,11 +1,10 @@
-from datetime import datetime, timedelta, timezone
-
-from ambientwill.engine import Engine
+from datetime import UTC, datetime, timedelta
 
 from conftest import make_urge
 
+from ambientwill.engine import Engine
 
-NOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
 
 def test_pause_and_resume(store) -> None:
@@ -33,7 +32,9 @@ def test_events_and_why_are_persisted(store, policy) -> None:
 
 def test_read_only_snapshot_does_not_create_file(tmp_path, policy) -> None:
     path = tmp_path / "missing.db"
-    snapshot = __import__("ambientwill.storage", fromlist=["Storage"]).Storage.snapshot(path)
+    snapshot = __import__("ambientwill.storage", fromlist=["Storage"]).Storage.snapshot(
+        path
+    )
 
     result = Engine(policy, snapshot).tick(at=NOW, dry_run=True)
 
