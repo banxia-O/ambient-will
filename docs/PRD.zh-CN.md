@@ -3,10 +3,10 @@ title: AmbientWill 中文产品需求文档
 aliases:
   - 潜意
   - AmbientWill PRD
-version: 0.1
+version: 0.2
 status: draft
 created: 2026-07-27
-updated: 2026-07-27
+updated: 2026-07-28
 visibility: public-ready
 tags:
   - PRD
@@ -16,7 +16,7 @@ tags:
   - Open-Source
 ---
 
-# AmbientWill（潜意）PRD v0.1
+# AmbientWill（潜意）PRD v0.2
 
 > A proactive cognition and messaging layer for persistent AI agents.  
 > 面向持久化 AI Agent 的主动认知、受控行动与消息层。
@@ -727,14 +727,35 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 
 读取最近会话、Context Bridge、真实 Outbox 投递和 Hermes adapter 均不属于 v0.1；这些能力必须在离线 shadow replay 通过后另行设计、审查和授权。
 
-### v0.2：Adaptive Presence
+### v0.2：Desire Ledger + Progress Loop（已实现）
 
-- 用户反馈分类；
-- 动态退避；
-- preferred time / avoid topic；
-- Desire progress；
-- 更细的 Urge 衰减与合并；
-- token 和成本预算。
+- 显式创建并持久化 Desire；不允许模型自动创造 Desire；
+- 使用追加式 Progress 历史更新当前投影，revision 每次恰好加 1；
+- 使用 `expected_revision` 做乐观并发校验，冲突时整笔回滚；
+- 到 `next_review_at` 后按固定公式复查，不联网、不调用 LLM；
+- 每个 `(desire_id, revision)` 最多记录一次 Review、创建一个候选 Urge；
+- 只有新的 Progress revision 能重新获得评估资格；
+- 候选 Urge 使用独立关联表记录 Desire/revision 来源；任意新 Progress 都在
+  同一事务中使旧 revision 的 open Urge 失效，不影响手工 Urge；
+- open Desire/Progress 的 `next_review_at` 不得早于创建/记录时刻，Reviewer
+  对旧版本或手工 SQL 形成的坏数据继续 fail closed；到期过滤与稳定排序先解析
+  aware datetime，再按绝对时刻比较，不依赖 ISO-8601 TEXT 的字典序；
+- Progress 的 `recorded_at` 不得早于其推进的 revision 已提交 Review 时刻；
+  等价 offset 按绝对时刻比较，非法旧数据在 history、projection 与 Urge 状态
+  发生变化前 fail closed；
+- expired、blocked、satisfied、abandoned 状态均可审计；终态不得重开；
+- Reviewer 只产生普通 Urge，`SLEEP / REFLECT / MESSAGE_PLANNED` 仍由 v0.1
+  Engine 与原有门禁决定；
+- `desire-list`、`desire-show` 与 `desire-review --dry-run` 使用只读快照，
+  严格校验数据目录、数据库、锁和 WAL/SHM 的类型与私有权限，不修改源内容
+  或元数据；复制使用稳定的目录相对文件描述符并在复制前后复核身份与元数据，
+  校验后的路径替换必须 fail closed；
+- v0.2 表与索引在一个显式 SQLite 事务中升级，DDL 中途失败时旧 schema 和
+  数据保持完整。
+
+v0.2 仍未实现：用户反馈分类、动态退避、preferred time / avoid topic、
+Urge 衰减与合并、token/成本预算、模型自动创建 Desire、定时后台进程、
+真实消息生成与投递、Context Bridge，以及任何 Hermes adapter。
 
 ### v0.3：Bounded Action
 

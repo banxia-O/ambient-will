@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ambient-will"
-version = "0.1.0"
-description = "Offline shadow simulator for bounded proactive agent decisions"
+version = "0.2.0"
+description = "Offline desire ledger and shadow simulator for proactive agents"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = []

@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Self
 from zoneinfo import ZoneInfo
 
-from ambientwill.models import OutboxEvent, Urge, WakeEvent
+from ambientwill.models import (
+    DESIRE_STATUSES,
+    Desire,
+    DesireProgress,
+    DesireReview,
+    OutboxEvent,
+    Urge,
+    WakeEvent,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -56,6 +64,62 @@ CREATE TABLE IF NOT EXISTS outbox (
     cooldown_key TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS desires (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    urge_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    target_state TEXT NOT NULL,
+    current_state TEXT NOT NULL,
+    next_step TEXT NOT NULL,
+    importance REAL NOT NULL,
+    gap REAL NOT NULL,
+    confidence REAL NOT NULL,
+    actionability REAL NOT NULL,
+    interruption_cost REAL NOT NULL,
+    cooldown_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    next_review_at TEXT,
+    expires_at TEXT,
+    status TEXT NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS desire_progress (
+    id TEXT PRIMARY KEY,
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    recorded_at TEXT NOT NULL,
+    from_revision INTEGER NOT NULL,
+    to_revision INTEGER NOT NULL,
+    current_state TEXT NOT NULL,
+    next_step TEXT NOT NULL,
+    gap REAL NOT NULL,
+    actionability REAL NOT NULL,
+    next_review_at TEXT,
+    status TEXT NOT NULL,
+    note TEXT,
+    UNIQUE(desire_id, to_revision)
+);
+
+CREATE TABLE IF NOT EXISTS desire_reviews (
+    id TEXT PRIMARY KEY,
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    revision INTEGER NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    score REAL NOT NULL,
+    outcome TEXT NOT NULL,
+    urge_id TEXT REFERENCES urges(id),
+    reasons TEXT NOT NULL,
+    UNIQUE(desire_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS desire_urge_links (
+    urge_id TEXT PRIMARY KEY REFERENCES urges(id),
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    desire_revision INTEGER NOT NULL,
+    UNIQUE(desire_id, desire_revision)
+);
+
 CREATE INDEX IF NOT EXISTS idx_urges_status_created
 ON urges(status, created_at);
 
@@ -64,6 +128,18 @@ ON outbox(planned_at);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wake_trigger_evaluated_at
 ON wake_events(trigger, evaluated_at);
+
+CREATE INDEX IF NOT EXISTS idx_desires_due
+ON desires(status, next_review_at, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_desire_progress_history
+ON desire_progress(desire_id, to_revision);
+
+CREATE INDEX IF NOT EXISTS idx_desire_reviews_history
+ON desire_reviews(desire_id, revision);
+
+CREATE INDEX IF NOT EXISTS idx_desire_urge_links_desire
+ON desire_urge_links(desire_id, desire_revision);
 """
 
 
@@ -75,6 +151,18 @@ def _canonical_timestamp(value: datetime) -> str:
     if value.tzinfo is None:
         raise ValueError("timestamp must include a timezone")
     return value.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def _parse_persisted_timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed
 
 
 def _reject_symlink_components(path: Path) -> None:
@@ -89,6 +177,150 @@ def _reject_symlink_components(path: Path) -> None:
             break
         if stat.S_ISLNK(metadata.st_mode):
             raise OSError(f"refusing symlink path component: {current}")
+
+
+def _validate_snapshot_entry(
+    path: Path,
+    *,
+    expect_directory: bool,
+    label: str,
+) -> os.stat_result | None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    expected_type = (
+        stat.S_ISDIR(metadata.st_mode)
+        if expect_directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if not expected_type:
+        expected = "directory" if expect_directory else "regular file"
+        raise OSError(f"{label} must be a {expected}: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise PermissionError(
+            f"{label} must not be accessible by group or others: {path}"
+        )
+    return metadata
+
+
+def _same_snapshot_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _snapshot_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_snapshot_descriptor(
+    descriptor: int,
+    expected: os.stat_result,
+    *,
+    expect_directory: bool,
+    label: str,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    expected_type = (
+        stat.S_ISDIR(metadata.st_mode)
+        if expect_directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if (
+        not expected_type
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or not _same_snapshot_identity(metadata, expected)
+    ):
+        raise OSError(f"{label} changed during snapshot")
+    return metadata
+
+
+def _open_snapshot_entry(
+    directory_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    label: str,
+) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise OSError(f"{label} changed during snapshot") from exc
+    try:
+        _validate_snapshot_descriptor(
+            descriptor,
+            expected,
+            expect_directory=False,
+            label=label,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _assert_snapshot_entry_unchanged(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    fingerprint: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    try:
+        current = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise OSError(f"{label} changed during snapshot") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not _same_snapshot_identity(opened, current)
+        or _snapshot_fingerprint(opened) != fingerprint
+    ):
+        raise OSError(f"{label} changed during snapshot")
+
+
+def _assert_snapshot_entry_absent(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> None:
+    try:
+        os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    raise OSError(f"{label} changed during snapshot")
+
+
+def _copy_snapshot_file(descriptor: int, target: Path) -> None:
+    with (
+        os.fdopen(os.dup(descriptor), "rb") as source,
+        target.open("wb") as destination,
+    ):
+        shutil.copyfileobj(source, destination)
 
 
 class TickLock:
@@ -131,15 +363,22 @@ class TickLock:
 class SnapshotLock:
     """Acquire a shared project lock without creating or modifying lock state."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, descriptor: int | None = None) -> None:
         self.path = path
+        self.descriptor = descriptor
         self._handle = None
 
     def __enter__(self) -> Self:
-        _reject_symlink_components(self.path)
-        if not self.path.exists():
-            return self
-        descriptor = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        if self.descriptor is None:
+            _reject_symlink_components(self.path)
+            if not self.path.exists():
+                return self
+            descriptor = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        else:
+            descriptor = os.dup(self.descriptor)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             os.close(descriptor)
@@ -177,10 +416,40 @@ class Storage:
 
     @classmethod
     def snapshot(cls, path: str | Path) -> Storage:
-        db_path = Path(path)
+        db_path = Path(path).absolute()
         _reject_symlink_components(db_path)
         lock_path = db_path.parent / "tick.lock"
-        if db_path.exists() and not lock_path.exists():
+        directory_metadata = _validate_snapshot_entry(
+            db_path.parent,
+            expect_directory=True,
+            label="data directory",
+        )
+        database_metadata = (
+            _validate_snapshot_entry(
+                db_path,
+                expect_directory=False,
+                label="database",
+            )
+            if directory_metadata is not None
+            else None
+        )
+        lock_metadata = (
+            _validate_snapshot_entry(
+                lock_path,
+                expect_directory=False,
+                label="project lock",
+            )
+            if directory_metadata is not None
+            else None
+        )
+        sidecar_metadata: dict[str, os.stat_result | None] = {}
+        for suffix in ("-wal", "-shm"):
+            sidecar_metadata[suffix] = _validate_snapshot_entry(
+                Path(f"{db_path}{suffix}"),
+                expect_directory=False,
+                label=f"SQLite {suffix[1:].upper()} sidecar",
+            )
+        if database_metadata is not None and lock_metadata is None:
             raise OSError(
                 f"project lock is missing for existing database: {lock_path}; "
                 "run ambientwill init before read-only inspection"
@@ -189,29 +458,178 @@ class Storage:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
-            with SnapshotLock(lock_path):
-                if db_path.exists():
-                    if db_path.is_symlink():
-                        raise OSError(f"refusing database symlink: {db_path}")
-                    with tempfile.TemporaryDirectory(
-                        prefix="ambientwill-snapshot-"
-                    ) as temp:
-                        copied = Path(temp) / db_path.name
-                        shutil.copy2(db_path, copied)
-                        for suffix in ("-wal", "-shm"):
-                            sidecar = Path(f"{db_path}{suffix}")
-                            if sidecar.exists():
-                                shutil.copy2(sidecar, Path(f"{copied}{suffix}"))
-                        source = sqlite3.connect(copied, timeout=1.0)
-                        try:
-                            source.backup(connection)
-                        finally:
-                            source.close()
-                    result = connection.execute("PRAGMA quick_check").fetchone()
-                    if result is None or result[0] != "ok":
-                        raise sqlite3.DatabaseError("snapshot integrity check failed")
-                else:
+            if directory_metadata is None:
+                connection.executescript(SCHEMA)
+                return cls(db_path, read_only=True, memory_connection=connection)
+
+            directory_flags = (
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+            )
+            try:
+                directory_descriptor = os.open(db_path.parent, directory_flags)
+            except OSError as exc:
+                raise OSError("data directory changed during snapshot") from exc
+            try:
+                directory_fingerprint = _snapshot_fingerprint(
+                    _validate_snapshot_descriptor(
+                        directory_descriptor,
+                        directory_metadata,
+                        expect_directory=True,
+                        label="data directory",
+                    )
+                )
+                if database_metadata is None:
+                    _assert_snapshot_entry_absent(
+                        directory_descriptor,
+                        db_path.name,
+                        label="database",
+                    )
                     connection.executescript(SCHEMA)
+                    return cls(
+                        db_path,
+                        read_only=True,
+                        memory_connection=connection,
+                    )
+
+                if lock_metadata is None:
+                    raise OSError(
+                        f"project lock is missing for existing database: {lock_path}"
+                    )
+                lock_descriptor = _open_snapshot_entry(
+                    directory_descriptor,
+                    lock_path.name,
+                    lock_metadata,
+                    label="project lock",
+                )
+                lock_fingerprint = _snapshot_fingerprint(os.fstat(lock_descriptor))
+                try:
+                    with SnapshotLock(
+                        lock_path,
+                        descriptor=lock_descriptor,
+                    ):
+                        database_descriptor = _open_snapshot_entry(
+                            directory_descriptor,
+                            db_path.name,
+                            database_metadata,
+                            label="database",
+                        )
+                        database_fingerprint = _snapshot_fingerprint(
+                            os.fstat(database_descriptor)
+                        )
+                        sidecar_descriptors: dict[str, int] = {}
+                        sidecar_fingerprints: dict[str, tuple[int, ...]] = {}
+                        try:
+                            for suffix, expected in sidecar_metadata.items():
+                                name = f"{db_path.name}{suffix}"
+                                label = f"SQLite {suffix[1:].upper()} sidecar"
+                                if expected is None:
+                                    _assert_snapshot_entry_absent(
+                                        directory_descriptor,
+                                        name,
+                                        label=label,
+                                    )
+                                    continue
+                                descriptor = _open_snapshot_entry(
+                                    directory_descriptor,
+                                    name,
+                                    expected,
+                                    label=label,
+                                )
+                                sidecar_descriptors[suffix] = descriptor
+                                sidecar_fingerprints[suffix] = _snapshot_fingerprint(
+                                    os.fstat(descriptor)
+                                )
+
+                            with tempfile.TemporaryDirectory(
+                                prefix="ambientwill-snapshot-"
+                            ) as temp:
+                                copied = Path(temp) / db_path.name
+                                _copy_snapshot_file(
+                                    database_descriptor,
+                                    copied,
+                                )
+                                for (
+                                    suffix,
+                                    descriptor,
+                                ) in sidecar_descriptors.items():
+                                    _copy_snapshot_file(
+                                        descriptor,
+                                        Path(f"{copied}{suffix}"),
+                                    )
+
+                                _assert_snapshot_entry_unchanged(
+                                    directory_descriptor,
+                                    db_path.name,
+                                    database_descriptor,
+                                    database_fingerprint,
+                                    label="database",
+                                )
+                                _assert_snapshot_entry_unchanged(
+                                    directory_descriptor,
+                                    lock_path.name,
+                                    lock_descriptor,
+                                    lock_fingerprint,
+                                    label="project lock",
+                                )
+                                for (
+                                    suffix,
+                                    descriptor,
+                                ) in sidecar_descriptors.items():
+                                    _assert_snapshot_entry_unchanged(
+                                        directory_descriptor,
+                                        f"{db_path.name}{suffix}",
+                                        descriptor,
+                                        sidecar_fingerprints[suffix],
+                                        label=(f"SQLite {suffix[1:].upper()} sidecar"),
+                                    )
+                                for suffix, expected in sidecar_metadata.items():
+                                    if expected is None:
+                                        _assert_snapshot_entry_absent(
+                                            directory_descriptor,
+                                            f"{db_path.name}{suffix}",
+                                            label=(
+                                                f"SQLite {suffix[1:].upper()} sidecar"
+                                            ),
+                                        )
+                                current_directory = os.fstat(directory_descriptor)
+                                try:
+                                    path_directory = os.lstat(db_path.parent)
+                                except OSError as exc:
+                                    raise OSError(
+                                        "data directory changed during snapshot"
+                                    ) from exc
+                                if (
+                                    not _same_snapshot_identity(
+                                        current_directory,
+                                        path_directory,
+                                    )
+                                    or _snapshot_fingerprint(current_directory)
+                                    != directory_fingerprint
+                                ):
+                                    raise OSError(
+                                        "data directory changed during snapshot"
+                                    )
+
+                                source = sqlite3.connect(
+                                    copied,
+                                    timeout=1.0,
+                                )
+                                try:
+                                    source.backup(connection)
+                                finally:
+                                    source.close()
+                        finally:
+                            os.close(database_descriptor)
+                            for descriptor in sidecar_descriptors.values():
+                                os.close(descriptor)
+                finally:
+                    os.close(lock_descriptor)
+            finally:
+                os.close(directory_descriptor)
+
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            if result is None or result[0] != "ok":
+                raise sqlite3.DatabaseError("snapshot integrity check failed")
         except Exception:
             connection.close()
             raise
@@ -259,8 +677,11 @@ class Storage:
             self.path.parent.mkdir(parents=True, mode=0o700)
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(SCHEMA)
-            connection.commit()
+            try:
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA}\nCOMMIT;")
+            except Exception:
+                connection.rollback()
+                raise
             os.chmod(self.path, 0o600)
 
     def add_urge(self, urge: Urge) -> None:
@@ -286,6 +707,305 @@ class Storage:
                 ),
             )
             connection.commit()
+
+    def add_desire(self, desire: Desire) -> None:
+        with TickLock(self.lock_path), self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO desires (
+                    id, source, urge_type, reason, target_state, current_state,
+                    next_step, importance, gap, confidence, actionability,
+                    interruption_cost, cooldown_key, created_at, next_review_at,
+                    expires_at, status, revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    desire.id,
+                    desire.source,
+                    desire.urge_type,
+                    desire.reason,
+                    desire.target_state,
+                    desire.current_state,
+                    desire.next_step,
+                    desire.importance,
+                    desire.gap,
+                    desire.confidence,
+                    desire.actionability,
+                    desire.interruption_cost,
+                    desire.cooldown_key,
+                    _canonical_timestamp(desire.created_at),
+                    (
+                        _canonical_timestamp(desire.next_review_at)
+                        if desire.next_review_at
+                        else None
+                    ),
+                    (
+                        _canonical_timestamp(desire.expires_at)
+                        if desire.expires_at
+                        else None
+                    ),
+                    desire.status,
+                    desire.revision,
+                ),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _desire_from_row(row: sqlite3.Row) -> Desire:
+        return Desire(
+            id=row["id"],
+            source=row["source"],
+            urge_type=row["urge_type"],
+            reason=row["reason"],
+            target_state=row["target_state"],
+            current_state=row["current_state"],
+            next_step=row["next_step"],
+            importance=float(row["importance"]),
+            gap=float(row["gap"]),
+            confidence=float(row["confidence"]),
+            actionability=float(row["actionability"]),
+            interruption_cost=float(row["interruption_cost"]),
+            cooldown_key=row["cooldown_key"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            next_review_at=(
+                datetime.fromisoformat(row["next_review_at"])
+                if row["next_review_at"]
+                else None
+            ),
+            expires_at=(
+                datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
+            ),
+            status=row["status"],
+            revision=int(row["revision"]),
+        )
+
+    def get_desire(self, desire_id: str) -> Desire | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM desires WHERE id = ?", (desire_id,)
+            ).fetchone()
+        return self._desire_from_row(row) if row else None
+
+    def list_desires(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[Desire]:
+        if status is not None and status not in DESIRE_STATUSES:
+            raise ValueError(f"unsupported desire status: {status}")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        query = "SELECT * FROM desires"
+        parameters: list[object] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            parameters.append(status)
+        query += (
+            " ORDER BY next_review_at IS NULL, next_review_at ASC, "
+            "created_at ASC, id ASC LIMIT ?"
+        )
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._desire_from_row(row) for row in rows]
+
+    @staticmethod
+    def _progress_from_row(row: sqlite3.Row) -> DesireProgress:
+        return DesireProgress(
+            id=row["id"],
+            desire_id=row["desire_id"],
+            recorded_at=datetime.fromisoformat(row["recorded_at"]),
+            from_revision=int(row["from_revision"]),
+            to_revision=int(row["to_revision"]),
+            current_state=row["current_state"],
+            next_step=row["next_step"],
+            gap=float(row["gap"]),
+            actionability=float(row["actionability"]),
+            next_review_at=(
+                datetime.fromisoformat(row["next_review_at"])
+                if row["next_review_at"]
+                else None
+            ),
+            status=row["status"],
+            note=row["note"],
+        )
+
+    @staticmethod
+    def _review_from_row(row: sqlite3.Row) -> DesireReview:
+        return DesireReview(
+            id=row["id"],
+            desire_id=row["desire_id"],
+            revision=int(row["revision"]),
+            evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+            score=float(row["score"]),
+            outcome=row["outcome"],
+            urge_id=row["urge_id"],
+            reasons=json.loads(row["reasons"]),
+        )
+
+    def desire_details(self, desire_id: str) -> dict[str, object]:
+        desire = self.get_desire(desire_id)
+        if desire is None:
+            raise ValueError(f"desire not found: {desire_id}")
+        with self.connect() as connection:
+            progress_rows = connection.execute(
+                """
+                SELECT * FROM desire_progress
+                WHERE desire_id = ? ORDER BY to_revision ASC, id ASC
+                """,
+                (desire_id,),
+            ).fetchall()
+            review_rows = connection.execute(
+                """
+                SELECT * FROM desire_reviews
+                WHERE desire_id = ? ORDER BY revision ASC, id ASC
+                """,
+                (desire_id,),
+            ).fetchall()
+        return {
+            "desire": desire.to_dict(),
+            "progress": [
+                self._progress_from_row(row).to_dict() for row in progress_rows
+            ],
+            "reviews": [self._review_from_row(row).to_dict() for row in review_rows],
+        }
+
+    def record_desire_progress(
+        self,
+        progress: DesireProgress,
+        *,
+        fail_after_history: bool = False,
+        fail_after_urge_expiry: bool = False,
+    ) -> Desire:
+        with TickLock(self.lock_path), self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM desires WHERE id = ?", (progress.desire_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"desire not found: {progress.desire_id}")
+                current = self._desire_from_row(row)
+                if current.revision != progress.from_revision:
+                    raise ValueError(
+                        "revision conflict: "
+                        f"expected {progress.from_revision}, current {current.revision}"
+                    )
+                if current.status in {"satisfied", "abandoned", "expired"}:
+                    raise ValueError(
+                        f"terminal desire cannot accept progress: {current.status}"
+                    )
+                if progress.recorded_at < current.created_at:
+                    raise ValueError("progress cannot predate desire creation")
+                previous = connection.execute(
+                    """
+                    SELECT recorded_at FROM desire_progress
+                    WHERE desire_id = ? ORDER BY to_revision DESC LIMIT 1
+                    """,
+                    (progress.desire_id,),
+                ).fetchone()
+                if (
+                    previous is not None
+                    and progress.recorded_at
+                    < datetime.fromisoformat(previous["recorded_at"])
+                ):
+                    raise ValueError("progress time cannot move backwards")
+                review = connection.execute(
+                    """
+                    SELECT evaluated_at FROM desire_reviews
+                    WHERE desire_id = ? AND revision = ?
+                    """,
+                    (progress.desire_id, progress.from_revision),
+                ).fetchone()
+                if review is not None:
+                    reviewed_at = _parse_persisted_timestamp(
+                        review["evaluated_at"],
+                        label="current revision review time",
+                    )
+                    if progress.recorded_at < reviewed_at:
+                        raise ValueError(
+                            "progress cannot predate current revision review"
+                        )
+                connection.execute(
+                    """
+                    INSERT INTO desire_progress (
+                        id, desire_id, recorded_at, from_revision, to_revision,
+                        current_state, next_step, gap, actionability,
+                        next_review_at, status, note
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        progress.id,
+                        progress.desire_id,
+                        _canonical_timestamp(progress.recorded_at),
+                        progress.from_revision,
+                        progress.to_revision,
+                        progress.current_state,
+                        progress.next_step,
+                        progress.gap,
+                        progress.actionability,
+                        (
+                            _canonical_timestamp(progress.next_review_at)
+                            if progress.next_review_at
+                            else None
+                        ),
+                        progress.status,
+                        progress.note,
+                    ),
+                )
+                if fail_after_history:
+                    raise sqlite3.OperationalError(
+                        "injected progress transaction failure"
+                    )
+                connection.execute(
+                    """
+                    UPDATE urges
+                    SET status = 'expired'
+                    WHERE status = 'open'
+                      AND id IN (
+                          SELECT urge_id FROM desire_urge_links
+                          WHERE desire_id = ? AND desire_revision < ?
+                      )
+                    """,
+                    (progress.desire_id, progress.to_revision),
+                )
+                if fail_after_urge_expiry:
+                    raise sqlite3.OperationalError(
+                        "injected urge expiry transaction failure"
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE desires
+                    SET current_state = ?, next_step = ?, gap = ?,
+                        actionability = ?, next_review_at = ?, status = ?, revision = ?
+                    WHERE id = ? AND revision = ?
+                    """,
+                    (
+                        progress.current_state,
+                        progress.next_step,
+                        progress.gap,
+                        progress.actionability,
+                        (
+                            _canonical_timestamp(progress.next_review_at)
+                            if progress.next_review_at
+                            else None
+                        ),
+                        progress.status,
+                        progress.to_revision,
+                        progress.desire_id,
+                        progress.from_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError(
+                        "desire projection changed during progress update"
+                    )
+                updated_row = connection.execute(
+                    "SELECT * FROM desires WHERE id = ?", (progress.desire_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self._desire_from_row(updated_row)
 
     def set_urge_status(self, urge_id: str, status: str) -> None:
         if status not in {"open", "closed", "expired"}:

@@ -7,9 +7,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_desire
 
 from ambientwill.cli import main
-from ambientwill.models import Decision, WakeEvent
+from ambientwill.desires import DesireReviewer
+from ambientwill.models import Decision, DesireProgress, WakeEvent
 from ambientwill.storage import AlreadyRunningError, Storage, TickLock
 
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -173,3 +175,47 @@ def test_error_json_fails_closed_for_corrupt_database(tmp_path: Path, capsys) ->
     assert code != 0
     assert payload["decision"] == "SLEEP"
     assert payload["blocked_by"] == "storage_error"
+
+
+def test_desire_writes_share_the_project_lock(store, policy) -> None:
+    desire = make_desire()
+    progress = DesireProgress(
+        id="progress-lock",
+        desire_id=desire.id,
+        recorded_at=NOW,
+        from_revision=1,
+        to_revision=2,
+        current_state="The checkpoint is in progress.",
+        next_step="Finish the checkpoint.",
+        gap=0.5,
+        actionability=0.8,
+        next_review_at=NOW,
+        status="open",
+    )
+
+    with TickLock(store.lock_path), pytest.raises(AlreadyRunningError):
+        store.add_desire(desire)
+    store.add_desire(desire)
+    with TickLock(store.lock_path), pytest.raises(AlreadyRunningError):
+        store.record_desire_progress(progress)
+    with TickLock(store.lock_path), pytest.raises(AlreadyRunningError):
+        DesireReviewer(policy, store).review(at=NOW)
+
+
+def test_desire_read_command_fails_closed_for_corrupt_database(
+    tmp_path: Path, capsys
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir(mode=0o700)
+    database = data / "ambientwill.db"
+    database.write_text("not sqlite", encoding="utf-8")
+    os.chmod(database, 0o600)
+    (data / "tick.lock").write_text("", encoding="utf-8")
+    os.chmod(data / "tick.lock", 0o600)
+
+    code = main(["desire-list", "--data-dir", str(data), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert payload["blocked_by"] == "storage_error"
+    assert not (data / "ambientwill.db-wal").exists()

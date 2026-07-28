@@ -6,14 +6,15 @@ import sqlite3
 import sys
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
 from ambientwill import __version__
 from ambientwill.config import ConfigError, load_policy, write_default_config
+from ambientwill.desires import DesireReviewer
 from ambientwill.engine import Engine
-from ambientwill.models import Urge, ValidationError
+from ambientwill.models import Desire, DesireProgress, Urge, ValidationError
 from ambientwill.storage import AlreadyRunningError, Storage, TickLock
 
 DEFAULT_CONFIG_PATH = Path("ambientwill.toml")
@@ -55,7 +56,7 @@ def _add_data_dir(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = SafeArgumentParser(
         prog="ambientwill",
-        description="AmbientWill v0.1 offline shadow simulator",
+        description="AmbientWill v0.2 offline desire ledger and shadow simulator",
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -83,6 +84,77 @@ def build_parser() -> argparse.ArgumentParser:
     urge_add.add_argument("--cooldown-key")
     urge_add.add_argument("--expires-at")
     _add_json(urge_add)
+
+    desire_add = subparsers.add_parser(
+        "desire-add", help="add an explicit local Desire"
+    )
+    _add_config(desire_add)
+    _add_data_dir(desire_add)
+    desire_add.add_argument("--id")
+    desire_add.add_argument("--source", required=True)
+    desire_add.add_argument("--urge-type", required=True)
+    desire_add.add_argument("--reason", required=True)
+    desire_add.add_argument("--target-state", required=True)
+    desire_add.add_argument("--current-state", required=True)
+    desire_add.add_argument("--next-step", required=True)
+    desire_add.add_argument("--importance", required=True, type=float)
+    desire_add.add_argument("--gap", required=True, type=float)
+    desire_add.add_argument("--confidence", required=True, type=float)
+    desire_add.add_argument("--actionability", required=True, type=float)
+    desire_add.add_argument("--interruption-cost", required=True, type=float)
+    desire_add.add_argument("--cooldown-key", required=True)
+    desire_add.add_argument("--created-at")
+    desire_add.add_argument("--next-review-at")
+    desire_add.add_argument("--expires-at")
+    desire_add.add_argument("--status", default="open")
+    _add_json(desire_add)
+
+    desire_list = subparsers.add_parser(
+        "desire-list", help="list Desire projections from a read-only snapshot"
+    )
+    _add_config(desire_list)
+    _add_data_dir(desire_list)
+    desire_list.add_argument("--status")
+    desire_list.add_argument("--limit", type=int, default=50)
+    _add_json(desire_list)
+
+    desire_show = subparsers.add_parser(
+        "desire-show", help="show a Desire and its append-only history"
+    )
+    _add_config(desire_show)
+    _add_data_dir(desire_show)
+    desire_show.add_argument("desire_id", nargs="?")
+    desire_show.add_argument("--id", dest="desire_id_option")
+    _add_json(desire_show)
+
+    desire_progress = subparsers.add_parser(
+        "desire-progress", help="append Progress and update a Desire projection"
+    )
+    _add_config(desire_progress)
+    _add_data_dir(desire_progress)
+    desire_progress.add_argument("--id", "--desire-id", dest="desire_id", required=True)
+    desire_progress.add_argument("--progress-id")
+    desire_progress.add_argument("--expected-revision", required=True, type=int)
+    desire_progress.add_argument("--recorded-at")
+    desire_progress.add_argument("--current-state", required=True)
+    desire_progress.add_argument("--next-step", required=True)
+    desire_progress.add_argument("--gap", required=True, type=float)
+    desire_progress.add_argument("--actionability", required=True, type=float)
+    desire_progress.add_argument("--next-review-at")
+    desire_progress.add_argument("--status", required=True)
+    desire_progress.add_argument("--note")
+    _add_json(desire_progress)
+
+    desire_review = subparsers.add_parser(
+        "desire-review", help="deterministically review due Desire revisions"
+    )
+    _add_config(desire_review)
+    _add_data_dir(desire_review)
+    desire_review.add_argument(
+        "--at", required=True, help="aware ISO-8601 evaluation time"
+    )
+    desire_review.add_argument("--dry-run", action="store_true")
+    _add_json(desire_review)
 
     tick = subparsers.add_parser("tick", help="evaluate one candidate wake-up")
     _add_config(tick)
@@ -211,6 +283,114 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
         )
         storage.add_urge(urge)
         return {"ok": True, "urge": urge.to_dict()}, f"Added urge {urge.id}"
+
+    if args.command == "desire-add":
+        load_policy(args.config)
+        storage = _writable_storage(args.data_dir)
+        created_at = (
+            _parse_datetime(args.created_at, None, require_aware=True)
+            if args.created_at
+            else datetime.now(UTC)
+        )
+        next_review_at = (
+            _parse_datetime(args.next_review_at, None, require_aware=True)
+            if args.next_review_at
+            else None
+        )
+        expires_at = (
+            _parse_datetime(args.expires_at, None, require_aware=True)
+            if args.expires_at
+            else None
+        )
+        desire = Desire(
+            id=args.id or f"desire_{uuid.uuid4().hex}",
+            source=args.source,
+            urge_type=args.urge_type,
+            reason=args.reason,
+            target_state=args.target_state,
+            current_state=args.current_state,
+            next_step=args.next_step,
+            importance=args.importance,
+            gap=args.gap,
+            confidence=args.confidence,
+            actionability=args.actionability,
+            interruption_cost=args.interruption_cost,
+            cooldown_key=args.cooldown_key,
+            created_at=created_at,
+            next_review_at=next_review_at,
+            expires_at=expires_at,
+            status=args.status,
+            revision=1,
+        )
+        storage.add_desire(desire)
+        return {"ok": True, "desire": desire.to_dict()}, f"Added desire {desire.id}"
+
+    if args.command == "desire-list":
+        storage = Storage.snapshot(_database_path(args.data_dir))
+        desires = storage.list_desires(status=args.status, limit=args.limit)
+        return {
+            "ok": True,
+            "desires": [desire.to_dict() for desire in desires],
+        }, f"{len(desires)} desire(s)"
+
+    if args.command == "desire-show":
+        if args.desire_id and args.desire_id_option:
+            raise ValueError("provide the Desire id once")
+        desire_id = args.desire_id_option or args.desire_id
+        if not desire_id:
+            raise ValueError("desire id is required")
+        storage = Storage.snapshot(_database_path(args.data_dir))
+        details = storage.desire_details(desire_id)
+        return {"ok": True, **details}, f"Desire {desire_id}"
+
+    if args.command == "desire-progress":
+        load_policy(args.config)
+        storage = _writable_storage(args.data_dir)
+        recorded_at = (
+            _parse_datetime(args.recorded_at, None, require_aware=True)
+            if args.recorded_at
+            else datetime.now(UTC)
+        )
+        next_review_at = (
+            _parse_datetime(args.next_review_at, None, require_aware=True)
+            if args.next_review_at
+            else None
+        )
+        progress = DesireProgress(
+            id=args.progress_id or f"progress_{uuid.uuid4().hex}",
+            desire_id=args.desire_id,
+            recorded_at=recorded_at,
+            from_revision=args.expected_revision,
+            to_revision=args.expected_revision + 1,
+            current_state=args.current_state,
+            next_step=args.next_step,
+            gap=args.gap,
+            actionability=args.actionability,
+            next_review_at=next_review_at,
+            status=args.status,
+            note=args.note,
+        )
+        desire = storage.record_desire_progress(progress)
+        return {
+            "ok": True,
+            "desire": desire.to_dict(),
+            "progress": progress.to_dict(),
+        }, f"Recorded progress for {desire.id} revision {desire.revision}"
+
+    if args.command == "desire-review":
+        policy = load_policy(args.config)
+        at = _parse_datetime(args.at, None, require_aware=True)
+        path = _database_path(args.data_dir)
+        storage = (
+            Storage.snapshot(path) if args.dry_run else _writable_storage(args.data_dir)
+        )
+        results = DesireReviewer(policy, storage).review(at=at, dry_run=args.dry_run)
+        return {
+            "ok": True,
+            "evaluated_at": at.isoformat(),
+            "dry_run": args.dry_run,
+            "results": results,
+        }, f"Reviewed {len(results)} desire revision(s)"
 
     if args.command in {"tick", "simulate"}:
         policy = load_policy(args.config)
