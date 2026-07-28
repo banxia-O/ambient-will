@@ -246,3 +246,107 @@ def test_reviewer_rolls_back_batch_when_revision_review_predates_progress(
     assert store.desire_details("a-valid")["reviews"] == []
     assert store.desire_details("z-corrupt")["reviews"] == []
     assert store.valid_urges(progress_recorded + timedelta(hours=1)) == []
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_reviewer_treats_equivalent_offset_as_due(store, policy, dry_run: bool) -> None:
+    store.add_desire(
+        make_desire(
+            desire_id="equivalent-due",
+            next_review_at=CREATED,
+        )
+    )
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desires SET next_review_at = ?
+            WHERE id = 'equivalent-due'
+            """,
+            ("2026-02-01T13:00:00+01:00",),
+        )
+        connection.commit()
+
+    results = DesireReviewer(policy, store).review(at=CREATED, dry_run=dry_run)
+
+    assert [item["desire_id"] for item in results] == ["equivalent-due"]
+    assert results[0]["outcome"] == "URGE_CREATED"
+    details = store.desire_details("equivalent-due")
+    assert len(details["reviews"]) == (0 if dry_run else 1)
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_reviewer_does_not_review_negative_offset_future_early(
+    store, policy, dry_run: bool
+) -> None:
+    store.add_desire(
+        make_desire(
+            desire_id="future-not-due",
+            next_review_at=CREATED + timedelta(hours=1),
+        )
+    )
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desires SET next_review_at = ?
+            WHERE id = 'future-not-due'
+            """,
+            ("2026-02-01T08:00:00-05:00",),
+        )
+        connection.commit()
+
+    results = DesireReviewer(policy, store).review(at=CREATED, dry_run=dry_run)
+
+    assert results == []
+    assert store.desire_details("future-not-due")["reviews"] == []
+    assert store.valid_urges(CREATED) == []
+
+
+def test_reviewer_orders_mixed_offsets_by_absolute_time(store, policy) -> None:
+    store.add_desire(make_desire(desire_id="earlier", next_review_at=CREATED))
+    store.add_desire(
+        make_desire(
+            desire_id="later",
+            next_review_at=CREATED + timedelta(minutes=30),
+        )
+    )
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE desires SET next_review_at = ? WHERE id = 'earlier'",
+            ("2026-02-01T13:00:00+01:00",),
+        )
+        connection.execute(
+            "UPDATE desires SET next_review_at = ? WHERE id = 'later'",
+            ("2026-02-01T07:30:00-05:00",),
+        )
+        connection.commit()
+
+    results = DesireReviewer(policy, store).review(
+        at=CREATED + timedelta(hours=1), dry_run=True
+    )
+
+    assert [item["desire_id"] for item in results] == ["earlier", "later"]
+
+
+def test_invalid_direct_sql_time_rolls_back_entire_review_batch(store, policy) -> None:
+    store.add_desire(make_desire(desire_id="valid"))
+    store.add_desire(make_desire(desire_id="invalid"))
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE desires SET next_review_at = ? WHERE id = 'invalid'",
+            ("0000-invalid-aware-time",),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError):
+        DesireReviewer(policy, store).review(at=REVIEW_AT)
+
+    assert store.desire_details("valid")["reviews"] == []
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_reviews").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_urge_links").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM urges").fetchone()[0] == 0

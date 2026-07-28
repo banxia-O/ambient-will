@@ -171,7 +171,9 @@ Time windows use the configured IANA timezone and left-closed, right-open
 semantics. Cross-midnight windows are supported. Quiet-hour clocks must use
 strict `HH:MM` format. An open Desire or Progress may be reviewed at its
 creation/recording time or later, never earlier; the reviewer also enforces
-this invariant when reading legacy or manually modified data.
+this invariant when reading legacy or manually modified data. Due filtering
+and stable ordering parse aware timestamps and compare absolute instants, so
+equivalent or mixed UTC offsets cannot skip or advance a review.
 
 New data directories are created with mode `0700`; the SQLite database and
 project lock use `0600`. Writable operations refuse database or directory

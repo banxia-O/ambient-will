@@ -738,7 +738,8 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 - 候选 Urge 使用独立关联表记录 Desire/revision 来源；任意新 Progress 都在
   同一事务中使旧 revision 的 open Urge 失效，不影响手工 Urge；
 - open Desire/Progress 的 `next_review_at` 不得早于创建/记录时刻，Reviewer
-  对旧版本或手工 SQL 形成的坏数据继续 fail closed；
+  对旧版本或手工 SQL 形成的坏数据继续 fail closed；到期过滤与稳定排序先解析
+  aware datetime，再按绝对时刻比较，不依赖 ISO-8601 TEXT 的字典序；
 - expired、blocked、satisfied、abandoned 状态均可审计；终态不得重开；
 - Reviewer 只产生普通 Urge，`SLEEP / REFLECT / MESSAGE_PLANNED` 仍由 v0.1
   Engine 与原有门禁决定；

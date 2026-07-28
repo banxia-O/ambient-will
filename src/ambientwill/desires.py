@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ambientwill.models import AgentPolicy, Desire, DesireReview, Urge
 from ambientwill.storage import Storage, TickLock, _canonical_timestamp
@@ -115,12 +115,22 @@ class DesireReviewer:
             SELECT * FROM desires
             WHERE status = 'open'
               AND next_review_at IS NOT NULL
-              AND next_review_at <= ?
-            ORDER BY next_review_at ASC, created_at ASC, id ASC
             """,
-            (_canonical_timestamp(at),),
         ).fetchall()
-        return [self.storage._desire_from_row(row) for row in rows]
+        desires = [self.storage._desire_from_row(row) for row in rows]
+        due = [
+            desire
+            for desire in desires
+            if desire.next_review_at is not None and desire.next_review_at <= at
+        ]
+        return sorted(
+            due,
+            key=lambda desire: (
+                desire.next_review_at.astimezone(UTC),
+                desire.created_at.astimezone(UTC),
+                desire.id,
+            ),
+        )
 
     def _existing_review(
         self,
