@@ -1,0 +1,13 @@
+[agent]
+timezone = "Asia/Singapore"
+quiet_hours = [
+  { start = "23:00", end = "07:00" },
+]
+daily_message_hard_limit = 10
+unanswered_limit = 3
+min_message_gap_minutes = 60
+jitter_min_minutes = 5
+jitter_max_minutes = 35
+cooldown_minutes = 180
+message_threshold = 1.0
+reflect_threshold = 0.5
