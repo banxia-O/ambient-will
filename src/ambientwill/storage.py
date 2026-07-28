@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Self
 from zoneinfo import ZoneInfo
 
-from ambientwill.models import OutboxEvent, Urge, WakeEvent
+from ambientwill.models import (
+    DESIRE_STATUSES,
+    Desire,
+    DesireProgress,
+    DesireReview,
+    OutboxEvent,
+    Urge,
+    WakeEvent,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -56,6 +64,55 @@ CREATE TABLE IF NOT EXISTS outbox (
     cooldown_key TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS desires (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    urge_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    target_state TEXT NOT NULL,
+    current_state TEXT NOT NULL,
+    next_step TEXT NOT NULL,
+    importance REAL NOT NULL,
+    gap REAL NOT NULL,
+    confidence REAL NOT NULL,
+    actionability REAL NOT NULL,
+    interruption_cost REAL NOT NULL,
+    cooldown_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    next_review_at TEXT,
+    expires_at TEXT,
+    status TEXT NOT NULL,
+    revision INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS desire_progress (
+    id TEXT PRIMARY KEY,
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    recorded_at TEXT NOT NULL,
+    from_revision INTEGER NOT NULL,
+    to_revision INTEGER NOT NULL,
+    current_state TEXT NOT NULL,
+    next_step TEXT NOT NULL,
+    gap REAL NOT NULL,
+    actionability REAL NOT NULL,
+    next_review_at TEXT,
+    status TEXT NOT NULL,
+    note TEXT,
+    UNIQUE(desire_id, to_revision)
+);
+
+CREATE TABLE IF NOT EXISTS desire_reviews (
+    id TEXT PRIMARY KEY,
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    revision INTEGER NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    score REAL NOT NULL,
+    outcome TEXT NOT NULL,
+    urge_id TEXT REFERENCES urges(id),
+    reasons TEXT NOT NULL,
+    UNIQUE(desire_id, revision)
+);
+
 CREATE INDEX IF NOT EXISTS idx_urges_status_created
 ON urges(status, created_at);
 
@@ -64,6 +121,15 @@ ON outbox(planned_at);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_wake_trigger_evaluated_at
 ON wake_events(trigger, evaluated_at);
+
+CREATE INDEX IF NOT EXISTS idx_desires_due
+ON desires(status, next_review_at, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_desire_progress_history
+ON desire_progress(desire_id, to_revision);
+
+CREATE INDEX IF NOT EXISTS idx_desire_reviews_history
+ON desire_reviews(desire_id, revision);
 """
 
 
@@ -286,6 +352,272 @@ class Storage:
                 ),
             )
             connection.commit()
+
+    def add_desire(self, desire: Desire) -> None:
+        with TickLock(self.lock_path), self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO desires (
+                    id, source, urge_type, reason, target_state, current_state,
+                    next_step, importance, gap, confidence, actionability,
+                    interruption_cost, cooldown_key, created_at, next_review_at,
+                    expires_at, status, revision
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    desire.id,
+                    desire.source,
+                    desire.urge_type,
+                    desire.reason,
+                    desire.target_state,
+                    desire.current_state,
+                    desire.next_step,
+                    desire.importance,
+                    desire.gap,
+                    desire.confidence,
+                    desire.actionability,
+                    desire.interruption_cost,
+                    desire.cooldown_key,
+                    _canonical_timestamp(desire.created_at),
+                    (
+                        _canonical_timestamp(desire.next_review_at)
+                        if desire.next_review_at
+                        else None
+                    ),
+                    (
+                        _canonical_timestamp(desire.expires_at)
+                        if desire.expires_at
+                        else None
+                    ),
+                    desire.status,
+                    desire.revision,
+                ),
+            )
+            connection.commit()
+
+    @staticmethod
+    def _desire_from_row(row: sqlite3.Row) -> Desire:
+        return Desire(
+            id=row["id"],
+            source=row["source"],
+            urge_type=row["urge_type"],
+            reason=row["reason"],
+            target_state=row["target_state"],
+            current_state=row["current_state"],
+            next_step=row["next_step"],
+            importance=float(row["importance"]),
+            gap=float(row["gap"]),
+            confidence=float(row["confidence"]),
+            actionability=float(row["actionability"]),
+            interruption_cost=float(row["interruption_cost"]),
+            cooldown_key=row["cooldown_key"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            next_review_at=(
+                datetime.fromisoformat(row["next_review_at"])
+                if row["next_review_at"]
+                else None
+            ),
+            expires_at=(
+                datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
+            ),
+            status=row["status"],
+            revision=int(row["revision"]),
+        )
+
+    def get_desire(self, desire_id: str) -> Desire | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM desires WHERE id = ?", (desire_id,)
+            ).fetchone()
+        return self._desire_from_row(row) if row else None
+
+    def list_desires(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[Desire]:
+        if status is not None and status not in DESIRE_STATUSES:
+            raise ValueError(f"unsupported desire status: {status}")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        query = "SELECT * FROM desires"
+        parameters: list[object] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            parameters.append(status)
+        query += (
+            " ORDER BY next_review_at IS NULL, next_review_at ASC, "
+            "created_at ASC, id ASC LIMIT ?"
+        )
+        parameters.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._desire_from_row(row) for row in rows]
+
+    @staticmethod
+    def _progress_from_row(row: sqlite3.Row) -> DesireProgress:
+        return DesireProgress(
+            id=row["id"],
+            desire_id=row["desire_id"],
+            recorded_at=datetime.fromisoformat(row["recorded_at"]),
+            from_revision=int(row["from_revision"]),
+            to_revision=int(row["to_revision"]),
+            current_state=row["current_state"],
+            next_step=row["next_step"],
+            gap=float(row["gap"]),
+            actionability=float(row["actionability"]),
+            next_review_at=(
+                datetime.fromisoformat(row["next_review_at"])
+                if row["next_review_at"]
+                else None
+            ),
+            status=row["status"],
+            note=row["note"],
+        )
+
+    @staticmethod
+    def _review_from_row(row: sqlite3.Row) -> DesireReview:
+        return DesireReview(
+            id=row["id"],
+            desire_id=row["desire_id"],
+            revision=int(row["revision"]),
+            evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
+            score=float(row["score"]),
+            outcome=row["outcome"],
+            urge_id=row["urge_id"],
+            reasons=json.loads(row["reasons"]),
+        )
+
+    def desire_details(self, desire_id: str) -> dict[str, object]:
+        desire = self.get_desire(desire_id)
+        if desire is None:
+            raise ValueError(f"desire not found: {desire_id}")
+        with self.connect() as connection:
+            progress_rows = connection.execute(
+                """
+                SELECT * FROM desire_progress
+                WHERE desire_id = ? ORDER BY to_revision ASC, id ASC
+                """,
+                (desire_id,),
+            ).fetchall()
+            review_rows = connection.execute(
+                """
+                SELECT * FROM desire_reviews
+                WHERE desire_id = ? ORDER BY revision ASC, id ASC
+                """,
+                (desire_id,),
+            ).fetchall()
+        return {
+            "desire": desire.to_dict(),
+            "progress": [
+                self._progress_from_row(row).to_dict() for row in progress_rows
+            ],
+            "reviews": [self._review_from_row(row).to_dict() for row in review_rows],
+        }
+
+    def record_desire_progress(
+        self,
+        progress: DesireProgress,
+        *,
+        fail_after_history: bool = False,
+    ) -> Desire:
+        with TickLock(self.lock_path), self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM desires WHERE id = ?", (progress.desire_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"desire not found: {progress.desire_id}")
+                current = self._desire_from_row(row)
+                if current.revision != progress.from_revision:
+                    raise ValueError(
+                        "revision conflict: "
+                        f"expected {progress.from_revision}, current {current.revision}"
+                    )
+                if current.status in {"satisfied", "abandoned", "expired"}:
+                    raise ValueError(
+                        f"terminal desire cannot accept progress: {current.status}"
+                    )
+                if progress.recorded_at < current.created_at:
+                    raise ValueError("progress cannot predate desire creation")
+                previous = connection.execute(
+                    """
+                    SELECT recorded_at FROM desire_progress
+                    WHERE desire_id = ? ORDER BY to_revision DESC LIMIT 1
+                    """,
+                    (progress.desire_id,),
+                ).fetchone()
+                if (
+                    previous is not None
+                    and progress.recorded_at
+                    < datetime.fromisoformat(previous["recorded_at"])
+                ):
+                    raise ValueError("progress time cannot move backwards")
+                connection.execute(
+                    """
+                    INSERT INTO desire_progress (
+                        id, desire_id, recorded_at, from_revision, to_revision,
+                        current_state, next_step, gap, actionability,
+                        next_review_at, status, note
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        progress.id,
+                        progress.desire_id,
+                        _canonical_timestamp(progress.recorded_at),
+                        progress.from_revision,
+                        progress.to_revision,
+                        progress.current_state,
+                        progress.next_step,
+                        progress.gap,
+                        progress.actionability,
+                        (
+                            _canonical_timestamp(progress.next_review_at)
+                            if progress.next_review_at
+                            else None
+                        ),
+                        progress.status,
+                        progress.note,
+                    ),
+                )
+                if fail_after_history:
+                    raise sqlite3.OperationalError(
+                        "injected progress transaction failure"
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE desires
+                    SET current_state = ?, next_step = ?, gap = ?,
+                        actionability = ?, next_review_at = ?, status = ?, revision = ?
+                    WHERE id = ? AND revision = ?
+                    """,
+                    (
+                        progress.current_state,
+                        progress.next_step,
+                        progress.gap,
+                        progress.actionability,
+                        (
+                            _canonical_timestamp(progress.next_review_at)
+                            if progress.next_review_at
+                            else None
+                        ),
+                        progress.status,
+                        progress.to_revision,
+                        progress.desire_id,
+                        progress.from_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError(
+                        "desire projection changed during progress update"
+                    )
+                updated_row = connection.execute(
+                    "SELECT * FROM desires WHERE id = ?", (progress.desire_id,)
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return self._desire_from_row(updated_row)
 
     def set_urge_status(self, urge_id: str, status: str) -> None:
         if status not in {"open", "closed", "expired"}:

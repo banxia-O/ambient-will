@@ -3,10 +3,10 @@ title: AmbientWill 中文产品需求文档
 aliases:
   - 潜意
   - AmbientWill PRD
-version: 0.1
+version: 0.2
 status: draft
 created: 2026-07-27
-updated: 2026-07-27
+updated: 2026-07-28
 visibility: public-ready
 tags:
   - PRD
@@ -16,7 +16,7 @@ tags:
   - Open-Source
 ---
 
-# AmbientWill（潜意）PRD v0.1
+# AmbientWill（潜意）PRD v0.2
 
 > A proactive cognition and messaging layer for persistent AI agents.  
 > 面向持久化 AI Agent 的主动认知、受控行动与消息层。
@@ -727,14 +727,23 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 
 读取最近会话、Context Bridge、真实 Outbox 投递和 Hermes adapter 均不属于 v0.1；这些能力必须在离线 shadow replay 通过后另行设计、审查和授权。
 
-### v0.2：Adaptive Presence
+### v0.2：Desire Ledger + Progress Loop（已实现）
 
-- 用户反馈分类；
-- 动态退避；
-- preferred time / avoid topic；
-- Desire progress；
-- 更细的 Urge 衰减与合并；
-- token 和成本预算。
+- 显式创建并持久化 Desire；不允许模型自动创造 Desire；
+- 使用追加式 Progress 历史更新当前投影，revision 每次恰好加 1；
+- 使用 `expected_revision` 做乐观并发校验，冲突时整笔回滚；
+- 到 `next_review_at` 后按固定公式复查，不联网、不调用 LLM；
+- 每个 `(desire_id, revision)` 最多记录一次 Review、创建一个候选 Urge；
+- 只有新的 Progress revision 能重新获得评估资格；
+- expired、blocked、satisfied、abandoned 状态均可审计；终态不得重开；
+- Reviewer 只产生普通 Urge，`SLEEP / REFLECT / MESSAGE_PLANNED` 仍由 v0.1
+  Engine 与原有门禁决定；
+- `desire-list`、`desire-show` 与 `desire-review --dry-run` 使用只读快照，
+  不修改源数据库、WAL/SHM 或项目锁元数据。
+
+v0.2 仍未实现：用户反馈分类、动态退避、preferred time / avoid topic、
+Urge 衰减与合并、token/成本预算、模型自动创建 Desire、定时后台进程、
+真实消息生成与投递、Context Bridge，以及任何 Hermes adapter。
 
 ### v0.3：Bounded Action
 

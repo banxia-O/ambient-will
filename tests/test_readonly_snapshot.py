@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from conftest import make_desire
 
 import ambientwill.storage as storage_module
+from ambientwill.cli import main
 from ambientwill.storage import AlreadyRunningError, Storage, TickLock
 
 
@@ -104,3 +108,77 @@ def test_snapshot_shared_lock_blocks_project_writer_during_copy(
 
     assert writer_was_blocked is True
     assert snapshot.count_wake_events() == 0
+
+
+def test_desire_review_dry_run_preserves_all_source_metadata(
+    tmp_path: Path, capsys
+) -> None:
+    config = tmp_path / "ambientwill.toml"
+    data = tmp_path / "data"
+    assert (
+        main(["init", "--config", str(config), "--data-dir", str(data), "--json"]) == 0
+    )
+    capsys.readouterr()
+    created = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+    storage = Storage(data / "ambientwill.db")
+    storage.add_desire(
+        make_desire(
+            created_at=created,
+            next_review_at=created + timedelta(hours=1),
+        )
+    )
+    before = metadata(data)
+
+    assert (
+        main(
+            [
+                "desire-review",
+                "--config",
+                str(config),
+                "--data-dir",
+                str(data),
+                "--at",
+                "2026-02-01T13:00:00+00:00",
+                "--dry-run",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["results"][0]["outcome"] == "URGE_CREATED"
+    assert metadata(data) == before
+    assert storage.desire_details("desire-1")["reviews"] == []
+    assert storage.valid_urges(created + timedelta(hours=1)) == []
+
+
+def test_desire_list_and_show_preserve_all_source_metadata(
+    tmp_path: Path, capsys
+) -> None:
+    config = tmp_path / "ambientwill.toml"
+    data = tmp_path / "data"
+    main(["init", "--config", str(config), "--data-dir", str(data), "--json"])
+    capsys.readouterr()
+    storage = Storage(data / "ambientwill.db")
+    storage.add_desire(make_desire())
+    before = metadata(data)
+
+    assert main(["desire-list", "--data-dir", str(data), "--json"]) == 0
+    capsys.readouterr()
+    assert (
+        main(
+            [
+                "desire-show",
+                "--data-dir",
+                str(data),
+                "--id",
+                "desire-1",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert metadata(data) == before

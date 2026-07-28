@@ -3,9 +3,11 @@
 AmbientWill is a local-first proactive cognition and messaging layer for
 persistent AI agents.
 
-v0.1 is an **offline shadow simulator**. It evaluates whether a candidate
-wake-up should `SLEEP`, `REFLECT`, or produce `MESSAGE_PLANNED`. A planned
-message is only a local record of what a future real mode might do.
+v0.2 remains an **offline shadow simulator** and adds a persistent Desire
+Ledger with an append-only Progress loop. Deterministic Desire reviews create
+candidate Urges; the existing Engine still decides whether a Tick should
+`SLEEP`, `REFLECT`, or produce `MESSAGE_PLANNED`. A planned message is only a
+local record of what a future real mode might do.
 
 It never sends a real message.
 
@@ -22,7 +24,7 @@ The shadow core:
 
 AmbientWill is a removable sidecar, not an agent framework or a replacement for
 Hermes. Removing this repository and its selected data directory removes the
-entire v0.1 installation without changing the host.
+entire v0.2 installation without changing the host.
 
 ## Requirements
 
@@ -48,6 +50,53 @@ ambientwill urge-add \
   --urgency 0.7 \
   --confidence 0.8 \
   --interruption-cost 0.2
+```
+
+Create an explicit Desire with its first deterministic review time:
+
+```bash
+ambientwill desire-add \
+  --config ./ambientwill.toml \
+  --data-dir ./data \
+  --id example-goal \
+  --source project_goal \
+  --urge-type follow_up \
+  --reason "Advance an anonymous example goal." \
+  --target-state "The next checkpoint is complete." \
+  --current-state "The checkpoint is pending." \
+  --next-step "Complete the next anonymous checkpoint." \
+  --importance 0.8 --gap 0.7 --confidence 0.6 \
+  --actionability 0.9 --interruption-cost 0.2 \
+  --cooldown-key example-goal \
+  --next-review-at "2026-02-01T13:00:00+00:00" \
+  --json
+```
+
+Preview a due review without changing the database, WAL/SHM, or project lock:
+
+```bash
+ambientwill desire-review \
+  --config ./ambientwill.toml \
+  --data-dir ./data \
+  --at "2026-02-01T13:00:00+00:00" \
+  --dry-run \
+  --json
+```
+
+Append Progress with optimistic concurrency control:
+
+```bash
+ambientwill desire-progress \
+  --config ./ambientwill.toml \
+  --data-dir ./data \
+  --id example-goal \
+  --expected-revision 1 \
+  --current-state "The checkpoint is in progress." \
+  --next-step "Finish the checkpoint." \
+  --gap 0.5 --actionability 0.8 \
+  --next-review-at "2026-02-01T15:00:00+00:00" \
+  --status open \
+  --json
 ```
 
 Explain a candidate decision without writing a WakeEvent or Outbox event:
@@ -92,6 +141,18 @@ Every command that returns structured data supports `--json`.
 
 ## Decision loop
 
+Each Desire review:
+
+1. considers only open, due Desire revisions in stable order;
+2. calculates `importance × gap + confidence × actionability - interruption_cost`;
+3. records `SLEEP`, `EXPIRED`, or atomically creates one ordinary open Urge;
+4. records at most one Review per `(desire_id, revision)`;
+5. requires new append-only Progress to increment the revision and restore
+   review eligibility.
+
+The reviewer never calls the Engine. A normal Tick consumes the resulting Urge
+through the unchanged v0.1 gates, budgets, jitter, WakeEvent, and shadow Outbox.
+
 Each normal Tick:
 
 1. reads the local policy and ledger;
@@ -118,20 +179,24 @@ before querying, so they do not modify the selected data directory.
 
 ```bash
 python -m venv .venv
-.venv/bin/python -m pip install -e ".[test]" build
+.venv/bin/python -m pip install -e ".[test]" build twine
 .venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q src
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m compileall -q src tests
 .venv/bin/python -m build
+.venv/bin/python -m twine check dist/*
 ```
 
 ## Current limitations
 
-v0.1 does not generate message prose, deliver messages, query recent sessions,
-bridge replies into a live conversation, classify feedback, learn thresholds,
-run scheduled jobs, or integrate with Hermes. Those capabilities require a
-separate adapter and safety review after shadow replay has been evaluated.
+v0.2 does not create Desires automatically, increase pressure with elapsed
+time, generate message prose, deliver messages, query recent sessions, bridge
+replies into a live conversation, classify feedback, learn thresholds, run
+scheduled jobs, or integrate with Hermes. It does not call an LLM or access the
+network. Those capabilities require separate specifications and safety review.
 
-The SQLite schema is internal in v0.1 and may change before a host adapter is
+The SQLite schema is internal in v0.2 and may change before a host adapter is
 introduced.
 
 See [the Chinese PRD](docs/PRD.zh-CN.md) for the broader product direction.
