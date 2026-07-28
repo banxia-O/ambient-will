@@ -242,6 +242,12 @@ class Desire:
             raise ValidationError(f"unsupported desire status: {self.status}")
         if self.status == "open" and self.next_review_at is None:
             raise ValidationError("open desire requires next_review_at")
+        if (
+            self.status == "open"
+            and self.next_review_at is not None
+            and self.next_review_at < self.created_at
+        ):
+            raise ValidationError("next_review_at cannot be before created_at")
         if type(self.revision) is not int or self.revision < 1:
             raise ValidationError("revision must be a positive integer")
 
@@ -303,6 +309,12 @@ class DesireProgress:
             raise ValidationError(f"unsupported desire status: {self.status}")
         if self.status == "open" and self.next_review_at is None:
             raise ValidationError("open progress requires next_review_at")
+        if (
+            self.status == "open"
+            and self.next_review_at is not None
+            and self.next_review_at < self.recorded_at
+        ):
+            raise ValidationError("next_review_at cannot be before recorded_at")
         if self.note is not None:
             _normalize_text(self, "note")
 

@@ -151,6 +151,19 @@ def test_desire_cli_rejects_naive_time_and_missing_id(tmp_path: Path, capsys) ->
     assert missing_id["blocked_by"] in {"argument_error", "input_error"}
 
 
+def test_desire_add_cli_rejects_review_before_creation(tmp_path: Path, capsys) -> None:
+    config, data = initialize(tmp_path, capsys)
+    arguments = desire_add_args(config, data)
+    arguments[arguments.index("2026-02-01T13:00:00+00:00")] = (
+        "2026-02-01T11:59:59+00:00"
+    )
+
+    assert main(arguments) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["blocked_by"] == "input_error"
+    assert "before created_at" in payload["message"]
+
+
 def progress_args(config: Path, data: Path, *, expected: str = "1") -> list[str]:
     return [
         "desire-progress",
@@ -218,6 +231,23 @@ def test_desire_progress_cli_requires_expected_revision_and_appends_history(
     shown = json.loads(capsys.readouterr().out)
     assert shown["desire"]["revision"] == 2
     assert len(shown["progress"]) == 1
+
+
+def test_desire_progress_cli_rejects_review_before_recording(
+    tmp_path: Path, capsys
+) -> None:
+    config, data = initialize(tmp_path, capsys)
+    assert main(desire_add_args(config, data)) == 0
+    capsys.readouterr()
+    arguments = progress_args(config, data)
+    arguments[arguments.index("2026-02-01T14:00:00+00:00")] = (
+        "2026-02-01T12:29:59+00:00"
+    )
+
+    assert main(arguments) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["blocked_by"] == "input_error"
+    assert "before recorded_at" in payload["message"]
 
 
 def review_args(config: Path, data: Path, *, dry_run: bool = False) -> list[str]:

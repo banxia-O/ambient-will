@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -66,6 +66,19 @@ def test_open_desire_requires_next_step_and_review_time() -> None:
         make_desire(next_step="   ")
 
 
+def test_open_desire_review_time_cannot_precede_creation() -> None:
+    with pytest.raises(ValidationError, match="before created_at"):
+        make_desire(next_review_at=NOW - timedelta(microseconds=1))
+
+    at_creation = make_desire(next_review_at=NOW)
+    equivalent_offset = make_desire(
+        next_review_at=datetime(2026, 2, 1, 13, 0, tzinfo=timezone(timedelta(hours=1)))
+    )
+
+    assert at_creation.next_review_at == NOW
+    assert equivalent_offset.next_review_at == NOW
+
+
 def test_desire_rejects_naive_or_invalid_times_and_revision() -> None:
     with pytest.raises(ValidationError, match="created_at"):
         make_desire(created_at=NOW.replace(tzinfo=None))
@@ -99,6 +112,36 @@ def test_progress_requires_exact_revision_increment_and_open_review_time() -> No
         replace(progress, to_revision=3)
     with pytest.raises(ValidationError, match="next_review_at"):
         replace(progress, next_review_at=None)
+
+
+def test_open_progress_review_time_cannot_precede_recording() -> None:
+    recorded_at = NOW + timedelta(minutes=30)
+    progress = DesireProgress(
+        id="progress-time",
+        desire_id="desire-1",
+        recorded_at=recorded_at,
+        from_revision=1,
+        to_revision=2,
+        current_state="Checkpoint started.",
+        next_step="Finish the checkpoint.",
+        gap=0.5,
+        actionability=0.8,
+        next_review_at=recorded_at,
+        status="open",
+    )
+
+    assert progress.next_review_at == recorded_at
+    assert (
+        replace(
+            progress,
+            next_review_at=datetime(
+                2026, 2, 1, 13, 30, tzinfo=timezone(timedelta(hours=1))
+            ),
+        ).next_review_at
+        == recorded_at
+    )
+    with pytest.raises(ValidationError, match="before recorded_at"):
+        replace(progress, next_review_at=recorded_at - timedelta(microseconds=1))
 
 
 def test_review_requires_consistent_outcome_and_urge_link() -> None:

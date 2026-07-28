@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS desire_reviews (
     UNIQUE(desire_id, revision)
 );
 
+CREATE TABLE IF NOT EXISTS desire_urge_links (
+    urge_id TEXT PRIMARY KEY REFERENCES urges(id),
+    desire_id TEXT NOT NULL REFERENCES desires(id),
+    desire_revision INTEGER NOT NULL,
+    UNIQUE(desire_id, desire_revision)
+);
+
 CREATE INDEX IF NOT EXISTS idx_urges_status_created
 ON urges(status, created_at);
 
@@ -130,6 +137,9 @@ ON desire_progress(desire_id, to_revision);
 
 CREATE INDEX IF NOT EXISTS idx_desire_reviews_history
 ON desire_reviews(desire_id, revision);
+
+CREATE INDEX IF NOT EXISTS idx_desire_urge_links_desire
+ON desire_urge_links(desire_id, desire_revision);
 """
 
 
@@ -155,6 +165,31 @@ def _reject_symlink_components(path: Path) -> None:
             break
         if stat.S_ISLNK(metadata.st_mode):
             raise OSError(f"refusing symlink path component: {current}")
+
+
+def _validate_snapshot_entry(
+    path: Path,
+    *,
+    expect_directory: bool,
+    label: str,
+) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    expected_type = (
+        stat.S_ISDIR(metadata.st_mode)
+        if expect_directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if not expected_type:
+        expected = "directory" if expect_directory else "regular file"
+        raise OSError(f"{label} must be a {expected}: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise PermissionError(
+            f"{label} must not be accessible by group or others: {path}"
+        )
+    return True
 
 
 class TickLock:
@@ -246,7 +281,36 @@ class Storage:
         db_path = Path(path)
         _reject_symlink_components(db_path)
         lock_path = db_path.parent / "tick.lock"
-        if db_path.exists() and not lock_path.exists():
+        directory_exists = _validate_snapshot_entry(
+            db_path.parent,
+            expect_directory=True,
+            label="data directory",
+        )
+        database_exists = (
+            _validate_snapshot_entry(
+                db_path,
+                expect_directory=False,
+                label="database",
+            )
+            if directory_exists
+            else False
+        )
+        lock_exists = (
+            _validate_snapshot_entry(
+                lock_path,
+                expect_directory=False,
+                label="project lock",
+            )
+            if directory_exists
+            else False
+        )
+        for suffix in ("-wal", "-shm"):
+            _validate_snapshot_entry(
+                Path(f"{db_path}{suffix}"),
+                expect_directory=False,
+                label=f"SQLite {suffix[1:].upper()} sidecar",
+            )
+        if database_exists and not lock_exists:
             raise OSError(
                 f"project lock is missing for existing database: {lock_path}; "
                 "run ambientwill init before read-only inspection"
@@ -256,9 +320,7 @@ class Storage:
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             with SnapshotLock(lock_path):
-                if db_path.exists():
-                    if db_path.is_symlink():
-                        raise OSError(f"refusing database symlink: {db_path}")
+                if database_exists:
                     with tempfile.TemporaryDirectory(
                         prefix="ambientwill-snapshot-"
                     ) as temp:
@@ -325,8 +387,11 @@ class Storage:
             self.path.parent.mkdir(parents=True, mode=0o700)
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(SCHEMA)
-            connection.commit()
+            try:
+                connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA}\nCOMMIT;")
+            except Exception:
+                connection.rollback()
+                raise
             os.chmod(self.path, 0o600)
 
     def add_urge(self, urge: Urge) -> None:
@@ -518,6 +583,7 @@ class Storage:
         progress: DesireProgress,
         *,
         fail_after_history: bool = False,
+        fail_after_urge_expiry: bool = False,
     ) -> Desire:
         with TickLock(self.lock_path), self.connect() as connection:
             try:
@@ -582,6 +648,22 @@ class Storage:
                 if fail_after_history:
                     raise sqlite3.OperationalError(
                         "injected progress transaction failure"
+                    )
+                connection.execute(
+                    """
+                    UPDATE urges
+                    SET status = 'expired'
+                    WHERE status = 'open'
+                      AND id IN (
+                          SELECT urge_id FROM desire_urge_links
+                          WHERE desire_id = ? AND desire_revision < ?
+                      )
+                    """,
+                    (progress.desire_id, progress.to_revision),
+                )
+                if fail_after_urge_expiry:
+                    raise sqlite3.OperationalError(
+                        "injected urge expiry transaction failure"
                     )
                 cursor = connection.execute(
                     """

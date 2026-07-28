@@ -148,7 +148,9 @@ Each Desire review:
 3. records `SLEEP`, `EXPIRED`, or atomically creates one ordinary open Urge;
 4. records at most one Review per `(desire_id, revision)`;
 5. requires new append-only Progress to increment the revision and restore
-   review eligibility.
+   review eligibility;
+6. stores structured Desire/revision provenance for generated Urges and
+   expires every older linked open Urge when new Progress is recorded.
 
 The reviewer never calls the Engine. A normal Tick consumes the resulting Urge
 through the unchanged v0.1 gates, budgets, jitter, WakeEvent, and shadow Outbox.
@@ -167,13 +169,18 @@ Each normal Tick:
 
 Time windows use the configured IANA timezone and left-closed, right-open
 semantics. Cross-midnight windows are supported. Quiet-hour clocks must use
-strict `HH:MM` format.
+strict `HH:MM` format. An open Desire or Progress may be reviewed at its
+creation/recording time or later, never earlier; the reviewer also enforces
+this invariant when reading legacy or manually modified data.
 
 New data directories are created with mode `0700`; the SQLite database and
 project lock use `0600`. Writable operations refuse database or directory
 symlinks and refuse existing data directories that are accessible by group or
-others. Read-only commands copy the SQLite/WAL state into an in-memory snapshot
-before querying, so they do not modify the selected data directory.
+others. Read-only commands require private modes and regular-file types for the
+data directory, database, lock, and present WAL/SHM files, then copy the state
+into an in-memory snapshot without repairing or modifying the source. v0.2
+schema initialization is one explicit SQLite transaction, so an interrupted
+upgrade preserves the complete v0.1 schema and data.
 
 ## Development
 

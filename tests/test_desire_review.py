@@ -144,6 +144,11 @@ def test_review_batch_failure_rolls_back_reviews_urges_and_expiry(
     assert store.desire_details("second")["reviews"] == []
     assert store.get_desire("second").status == "open"
     assert store.valid_urges(REVIEW_AT) == []
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_urge_links").fetchone()[0]
+            == 0
+        )
 
 
 def test_review_uses_stable_order_and_skips_future_or_blocked_desires(
@@ -178,3 +183,66 @@ def test_dry_run_replay_is_stable_and_does_not_spend_revision(store, policy) -> 
     assert store.get_desire("desire-1").revision == 1
     assert store.desire_details("desire-1")["reviews"] == []
     assert store.valid_urges(REVIEW_AT) == []
+
+
+def test_reviewer_rejects_direct_sql_review_time_before_desire_creation(
+    store, policy
+) -> None:
+    store.add_desire(make_desire())
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desires SET next_review_at = ?
+            WHERE id = 'desire-1'
+            """,
+            ((CREATED - timedelta(hours=1)).isoformat(timespec="microseconds"),),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="before created_at"):
+        DesireReviewer(policy, store).review(at=REVIEW_AT)
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_reviews").fetchone()[0] == 0
+        )
+        assert connection.execute("SELECT COUNT(*) FROM urges").fetchone()[0] == 0
+
+
+def test_reviewer_rolls_back_batch_when_revision_review_predates_progress(
+    store, policy
+) -> None:
+    store.add_desire(make_desire(desire_id="a-valid"))
+    store.add_desire(make_desire(desire_id="z-corrupt"))
+    progress_recorded = REVIEW_AT + timedelta(hours=1)
+    store.record_desire_progress(
+        DesireProgress(
+            id="progress-corrupt",
+            desire_id="z-corrupt",
+            recorded_at=progress_recorded,
+            from_revision=1,
+            to_revision=2,
+            current_state="The anonymous checkpoint changed.",
+            next_step="Continue the anonymous checkpoint.",
+            gap=0.7,
+            actionability=0.9,
+            next_review_at=progress_recorded + timedelta(hours=1),
+            status="open",
+        )
+    )
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desires SET next_review_at = ?
+            WHERE id = 'z-corrupt'
+            """,
+            ((progress_recorded - timedelta(minutes=30)).isoformat(),),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="before current revision"):
+        DesireReviewer(policy, store).review(at=progress_recorded + timedelta(hours=1))
+
+    assert store.desire_details("a-valid")["reviews"] == []
+    assert store.desire_details("z-corrupt")["reviews"] == []
+    assert store.valid_urges(progress_recorded + timedelta(hours=1)) == []

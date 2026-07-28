@@ -137,6 +137,36 @@ class DesireReviewer:
         ).fetchone()
         return self.storage._review_from_row(row) if row else None
 
+    @staticmethod
+    def _assert_review_time_invariants(
+        connection: sqlite3.Connection,
+        desire: Desire,
+        at: datetime,
+    ) -> None:
+        if desire.revision == 1:
+            revision_started_at = desire.created_at
+            boundary_name = "created_at"
+        else:
+            row = connection.execute(
+                """
+                SELECT recorded_at FROM desire_progress
+                WHERE desire_id = ? AND to_revision = ?
+                """,
+                (desire.id, desire.revision),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    "current Desire revision has no corresponding Progress"
+                )
+            revision_started_at = datetime.fromisoformat(row["recorded_at"])
+            boundary_name = "current revision Progress.recorded_at"
+        if desire.next_review_at is None:
+            raise ValueError("open Desire requires next_review_at")
+        if desire.next_review_at < revision_started_at:
+            raise ValueError(f"next_review_at cannot be before {boundary_name}")
+        if at < revision_started_at:
+            raise ValueError(f"review time cannot be before {boundary_name}")
+
     def review(
         self,
         *,
@@ -157,6 +187,7 @@ class DesireReviewer:
                 results: list[dict[str, object]] = []
                 inserted_reviews = 0
                 for desire in self._due_desires(connection, at):
+                    self._assert_review_time_invariants(connection, desire, at)
                     existing = self._existing_review(
                         connection, desire.id, desire.revision
                     )
@@ -195,6 +226,14 @@ class DesireReviewer:
                                 ),
                                 urge.status,
                             ),
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO desire_urge_links (
+                                urge_id, desire_id, desire_revision
+                            ) VALUES (?, ?, ?)
+                            """,
+                            (urge.id, desire.id, desire.revision),
                         )
                     if review.outcome == "EXPIRED":
                         cursor = connection.execute(
@@ -243,6 +282,7 @@ class DesireReviewer:
     ) -> list[dict[str, object]]:
         results: list[dict[str, object]] = []
         for desire in self._due_desires(connection, at):
+            self._assert_review_time_invariants(connection, desire, at)
             existing = self._existing_review(connection, desire.id, desire.revision)
             if existing is not None:
                 results.append(self._already_reviewed(existing))

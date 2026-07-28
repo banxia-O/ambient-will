@@ -735,11 +735,18 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 - 到 `next_review_at` 后按固定公式复查，不联网、不调用 LLM；
 - 每个 `(desire_id, revision)` 最多记录一次 Review、创建一个候选 Urge；
 - 只有新的 Progress revision 能重新获得评估资格；
+- 候选 Urge 使用独立关联表记录 Desire/revision 来源；任意新 Progress 都在
+  同一事务中使旧 revision 的 open Urge 失效，不影响手工 Urge；
+- open Desire/Progress 的 `next_review_at` 不得早于创建/记录时刻，Reviewer
+  对旧版本或手工 SQL 形成的坏数据继续 fail closed；
 - expired、blocked、satisfied、abandoned 状态均可审计；终态不得重开；
 - Reviewer 只产生普通 Urge，`SLEEP / REFLECT / MESSAGE_PLANNED` 仍由 v0.1
   Engine 与原有门禁决定；
 - `desire-list`、`desire-show` 与 `desire-review --dry-run` 使用只读快照，
-  不修改源数据库、WAL/SHM 或项目锁元数据。
+  严格校验数据目录、数据库、锁和 WAL/SHM 的类型与私有权限，不修改源内容
+  或元数据；
+- v0.2 表与索引在一个显式 SQLite 事务中升级，DDL 中途失败时旧 schema 和
+  数据保持完整。
 
 v0.2 仍未实现：用户反馈分类、动态退避、preferred time / avoid topic、
 Urge 衰减与合并、token/成本预算、模型自动创建 Desire、定时后台进程、

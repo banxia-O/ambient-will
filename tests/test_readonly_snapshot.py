@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,11 +16,25 @@ from ambientwill.cli import main
 from ambientwill.storage import AlreadyRunningError, Storage, TickLock
 
 
-def metadata(path: Path) -> dict[str, tuple[int, int, int]]:
-    return {
-        item.name: (item.stat().st_size, item.stat().st_mtime_ns, item.stat().st_mode)
-        for item in path.iterdir()
-    }
+def metadata(path: Path) -> dict[str, tuple[int, int, int, int, int, str | None]]:
+    items = [path, *path.iterdir()]
+    result = {}
+    for item in items:
+        info = os.lstat(item)
+        digest = (
+            hashlib.sha256(item.read_bytes()).hexdigest()
+            if stat.S_ISREG(info.st_mode)
+            else None
+        )
+        result["." if item == path else item.name] = (
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_mode,
+            info.st_ino,
+            info.st_ctime_ns,
+            digest,
+        )
+    return result
 
 
 def test_snapshot_copies_active_wal_into_memory_without_touching_source(
@@ -70,6 +87,7 @@ def test_existing_database_without_project_lock_fails_closed(tmp_path: Path) -> 
     data.mkdir(mode=0o700)
     path = data / "ambientwill.db"
     sqlite3.connect(path).close()
+    os.chmod(path, 0o600)
     before = metadata(data)
 
     with pytest.raises(OSError, match="project lock is missing"):
@@ -181,4 +199,97 @@ def test_desire_list_and_show_preserve_all_source_metadata(
     )
     capsys.readouterr()
 
+    assert metadata(data) == before
+
+
+@pytest.mark.parametrize("target", ["directory", "database", "lock"])
+def test_snapshot_rejects_permissive_component_without_mutation(
+    tmp_path: Path, target: str
+) -> None:
+    storage = Storage(tmp_path / "data" / "ambientwill.db")
+    storage.initialize()
+    selected = {
+        "directory": storage.path.parent,
+        "database": storage.path,
+        "lock": storage.lock_path,
+    }[target]
+    os.chmod(selected, 0o755 if target == "directory" else 0o644)
+    before = metadata(storage.path.parent)
+
+    with pytest.raises(PermissionError, match="group or others"):
+        Storage.snapshot(storage.path)
+
+    assert metadata(storage.path.parent) == before
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_snapshot_rejects_permissive_sqlite_sidecar_without_mutation(
+    tmp_path: Path, suffix: str
+) -> None:
+    storage = Storage(tmp_path / "data" / "ambientwill.db")
+    storage.initialize()
+    writer = sqlite3.connect(storage.path)
+    try:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute(
+            "INSERT INTO settings(key, value) VALUES('sidecar_probe', 'private')"
+        )
+        writer.commit()
+        sidecar = Path(f"{storage.path}{suffix}")
+        assert sidecar.exists()
+        os.chmod(sidecar, 0o644)
+        before = metadata(storage.path.parent)
+
+        with pytest.raises(PermissionError, match="group or others"):
+            Storage.snapshot(storage.path)
+
+        assert metadata(storage.path.parent) == before
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["desire-list"],
+        ["desire-show", "--id", "desire-1"],
+        [
+            "desire-review",
+            "--at",
+            "2026-02-01T13:00:00+00:00",
+            "--dry-run",
+        ],
+        ["status"],
+        ["events"],
+        ["why"],
+        ["tick", "--at", "2026-02-01T13:00:00+00:00", "--dry-run"],
+        ["simulate", "--at", "2026-02-01T13:00:00+00:00"],
+    ],
+)
+def test_readonly_cli_commands_fail_closed_for_permissive_database(
+    tmp_path: Path, capsys, arguments: list[str]
+) -> None:
+    config = tmp_path / "ambientwill.toml"
+    data = tmp_path / "data"
+    assert (
+        main(["init", "--config", str(config), "--data-dir", str(data), "--json"]) == 0
+    )
+    capsys.readouterr()
+    storage = Storage(data / "ambientwill.db")
+    storage.add_desire(make_desire())
+    os.chmod(storage.path, 0o644)
+    before = metadata(data)
+    command = [*arguments]
+    if arguments[0] not in {"status", "events", "why"}:
+        command.extend(["--config", str(config)])
+    command.extend(["--data-dir", str(data), "--json"])
+
+    code = main(command)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code != 0
+    assert payload["blocked_by"] == "storage_error"
+    assert "desire" not in payload
+    assert "desires" not in payload
     assert metadata(data) == before

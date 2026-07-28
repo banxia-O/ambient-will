@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -73,6 +74,139 @@ def test_initialize_upgrades_v01_database_without_changing_old_data(
 
     assert {"desires", "desire_progress", "desire_reviews"} <= tables
     assert legacy == ("preserved",)
+
+
+def test_v02_schema_upgrade_is_atomic_under_authorizer_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data = tmp_path / "legacy-data"
+    data.mkdir(mode=0o700)
+    database = data / "ambientwill.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE urges (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            urgency REAL NOT NULL,
+            confidence REAL NOT NULL,
+            interruption_cost REAL NOT NULL,
+            cooldown_key TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE wake_events (
+            id TEXT PRIMARY KEY,
+            trigger TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL,
+            selected_urge_id TEXT,
+            decision TEXT NOT NULL,
+            reasons TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE outbox (
+            event_id TEXT PRIMARY KEY,
+            wake_event_id TEXT NOT NULL REFERENCES wake_events(id),
+            message_preview TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            planned_at TEXT NOT NULL,
+            delayed_until TEXT NOT NULL,
+            state TEXT NOT NULL,
+            cooldown_key TEXT NOT NULL
+        );
+        INSERT INTO settings VALUES ('legacy_probe', 'preserved');
+        INSERT INTO urges VALUES (
+            'legacy-urge', 'follow_up', 'Anonymous legacy reason.',
+            0.7, 0.8, 0.2, 'legacy', '2026-01-01T12:00:00+00:00',
+            NULL, 'open'
+        );
+        INSERT INTO wake_events VALUES (
+            'legacy-wake', 'legacy', '2026-01-01T12:00:00+00:00',
+            'legacy-urge', 'REFLECT', '[]', '2026-01-01T12:00:00+00:00'
+        );
+        INSERT INTO outbox VALUES (
+            'legacy-outbox', 'legacy-wake', 'Anonymous preview.',
+            'legacy-key', '2026-01-01T12:00:00+00:00',
+            '2026-01-01T12:00:00+00:00', 'planned', 'legacy'
+        );
+        """
+    )
+    connection.commit()
+    os.chmod(database, 0o600)
+
+    def master_rows(db: sqlite3.Connection) -> list[tuple]:
+        return db.execute(
+            """
+            SELECT type, name, tbl_name, sql FROM sqlite_master
+            ORDER BY type, name
+            """
+        ).fetchall()
+
+    before_master = master_rows(connection)
+    before_data = {
+        table: connection.execute(f"SELECT * FROM {table}").fetchall()
+        for table in ("settings", "urges", "wake_events", "outbox")
+    }
+    connection.close()
+
+    storage = Storage(database)
+    original_connect = storage.connect
+
+    def deny_second_v02_table(action, argument1, _argument2, _database, _trigger):
+        if action == sqlite3.SQLITE_CREATE_TABLE and argument1 == "desire_progress":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    @contextmanager
+    def failing_connect():
+        with original_connect() as active:
+            active.set_authorizer(deny_second_v02_table)
+            yield active
+
+    monkeypatch.setattr(storage, "connect", failing_connect)
+    with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+        storage.initialize()
+
+    connection = sqlite3.connect(database)
+    try:
+        assert master_rows(connection) == before_master
+        assert {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("settings", "urges", "wake_events", "outbox")
+        } == before_data
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(storage, "connect", original_connect)
+    storage.initialize()
+    connection = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "desires",
+            "desire_progress",
+            "desire_reviews",
+            "desire_urge_links",
+        } <= tables
+        assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        assert {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in ("settings", "urges", "wake_events", "outbox")
+        } == before_data
+    finally:
+        connection.close()
 
 
 def test_add_list_and_show_desire_are_stable_and_auditable(store: Storage) -> None:
