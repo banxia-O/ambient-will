@@ -39,6 +39,27 @@ Create a local configuration and SQLite ledger:
 ambientwill init --config ./ambientwill.toml --data-dir ./data
 ```
 
+### Calibrate the local timezone
+
+`ambientwill init` intentionally writes `timezone = "UTC"` as a portable
+public default. Before running real Ticks, change it to the user's preferred
+[IANA timezone](https://www.iana.org/time-zones), for example:
+
+```toml
+[agent]
+timezone = "Asia/Shanghai"
+```
+
+An agent performing the installation must not infer a user's timezone from the
+server location, IP address, or an offset seen in old data. Use an explicit
+user preference when available; otherwise ask the user which timezone should
+govern quiet hours, local-day budgets, and scheduled reviews. Then validate the
+result:
+
+```bash
+ambientwill config-check --config ./ambientwill.toml --json
+```
+
 Add an anonymous example Urge:
 
 ```bash
