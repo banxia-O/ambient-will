@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from datetime import UTC, datetime, timedelta
@@ -110,18 +111,18 @@ def test_snapshot_shared_lock_blocks_project_writer_during_copy(
 ) -> None:
     storage = Storage(tmp_path / "data" / "ambientwill.db")
     storage.initialize()
-    original_copy = storage_module.shutil.copy2
+    original_copy = storage_module._copy_snapshot_file
     writer_was_blocked = False
 
-    def probing_copy(source, target):
+    def probing_copy(descriptor, target):
         nonlocal writer_was_blocked
         if not writer_was_blocked:
             with pytest.raises(AlreadyRunningError), TickLock(storage.lock_path):
                 pass
             writer_was_blocked = True
-        return original_copy(source, target)
+        return original_copy(descriptor, target)
 
-    monkeypatch.setattr(storage_module.shutil, "copy2", probing_copy)
+    monkeypatch.setattr(storage_module, "_copy_snapshot_file", probing_copy)
     snapshot = Storage.snapshot(storage.path)
 
     assert writer_was_blocked is True
@@ -247,6 +248,118 @@ def test_snapshot_rejects_permissive_sqlite_sidecar_without_mutation(
         assert metadata(storage.path.parent) == before
     finally:
         writer.close()
+
+
+@pytest.mark.parametrize(
+    ("target", "label"),
+    [
+        ("directory", "data directory"),
+        ("database", "database"),
+        ("lock", "project lock"),
+        ("wal", "SQLite WAL sidecar"),
+        ("shm", "SQLite SHM sidecar"),
+    ],
+)
+def test_snapshot_fails_closed_when_validated_path_is_replaced(
+    tmp_path: Path, monkeypatch, target: str, label: str
+) -> None:
+    storage = Storage(tmp_path / "data" / "ambientwill.db")
+    storage.initialize()
+    writer = sqlite3.connect(storage.path)
+    try:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("PRAGMA wal_autocheckpoint = 0")
+        writer.execute("INSERT INTO settings(key, value) VALUES('trusted', 'original')")
+        writer.commit()
+
+        replacements = tmp_path / "replacements"
+        replacement_storage = Storage(replacements / "ambientwill.db")
+        replacement_storage.initialize()
+        with replacement_storage.connect() as connection:
+            connection.execute(
+                "INSERT INTO settings(key, value) VALUES('foreign', 'replacement')"
+            )
+            connection.commit()
+
+        if target in {"wal", "shm"}:
+            suffix = f"-{target}"
+            selected_replacement = tmp_path / f"replacement{suffix}"
+            shutil.copy2(Path(f"{storage.path}{suffix}"), selected_replacement)
+            os.chmod(selected_replacement, 0o600)
+        elif target == "database":
+            selected_replacement = replacement_storage.path
+        elif target == "lock":
+            selected_replacement = replacement_storage.lock_path
+        else:
+            selected_replacement = replacements
+
+        original_validate = storage_module._validate_snapshot_entry
+        replaced = False
+
+        def replace_after_validation(path, *, expect_directory, label):
+            nonlocal replaced
+            result = original_validate(
+                path,
+                expect_directory=expect_directory,
+                label=label,
+            )
+            if not replaced and label == expected_label:
+                if target == "directory":
+                    os.replace(storage.path.parent, tmp_path / "original-data")
+                    os.replace(selected_replacement, storage.path.parent)
+                else:
+                    selected = {
+                        "database": storage.path,
+                        "lock": storage.lock_path,
+                        "wal": Path(f"{storage.path}-wal"),
+                        "shm": Path(f"{storage.path}-shm"),
+                    }[target]
+                    os.replace(selected_replacement, selected)
+                replaced = True
+            return result
+
+        expected_label = label
+        monkeypatch.setattr(
+            storage_module,
+            "_validate_snapshot_entry",
+            replace_after_validation,
+        )
+
+        with pytest.raises(OSError, match="changed during snapshot"):
+            Storage.snapshot(storage.path)
+
+        assert replaced is True
+    finally:
+        writer.close()
+
+
+def test_snapshot_fails_closed_when_database_path_changes_during_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    storage = Storage(tmp_path / "data" / "ambientwill.db")
+    storage.initialize()
+    replacement = Storage(tmp_path / "replacement" / "ambientwill.db")
+    replacement.initialize()
+    original_copy = storage_module._copy_snapshot_file
+    replaced = False
+
+    def replace_while_copying(descriptor, target):
+        nonlocal replaced
+        if not replaced:
+            os.replace(replacement.path, storage.path)
+            replaced = True
+        return original_copy(descriptor, target)
+
+    monkeypatch.setattr(
+        storage_module,
+        "_copy_snapshot_file",
+        replace_while_copying,
+    )
+
+    with pytest.raises(OSError, match="database changed during snapshot"):
+        Storage.snapshot(storage.path)
+
+    assert replaced is True
 
 
 @pytest.mark.parametrize(

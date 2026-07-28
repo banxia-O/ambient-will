@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from ambientwill.cli import main
+from ambientwill.storage import Storage
 
 
 def initialize(tmp_path: Path, capsys) -> tuple[Path, Path]:
@@ -248,6 +249,26 @@ def test_desire_progress_cli_rejects_review_before_recording(
     payload = json.loads(capsys.readouterr().out)
     assert payload["blocked_by"] == "input_error"
     assert "before recorded_at" in payload["message"]
+
+
+def test_desire_progress_cli_rejects_backfill_before_committed_review(
+    tmp_path: Path, capsys
+) -> None:
+    config, data = initialize(tmp_path, capsys)
+    assert main(desire_add_args(config, data)) == 0
+    capsys.readouterr()
+    assert main(review_args(config, data)) == 0
+    capsys.readouterr()
+
+    assert main(progress_args(config, data)) == 2
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["blocked_by"] == "input_error"
+    assert "predate current revision review" in payload["message"]
+    details = Storage(data / "ambientwill.db").desire_details("desire-cli")
+    assert details["desire"]["revision"] == 1
+    assert details["progress"] == []
+    assert len(details["reviews"]) == 1
 
 
 def review_args(config: Path, data: Path, *, dry_run: bool = False) -> list[str]:

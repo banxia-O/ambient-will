@@ -740,12 +740,16 @@ Hermes 自带的 memory、skill 自改进与 Curator 继续独立运行；Ambien
 - open Desire/Progress 的 `next_review_at` 不得早于创建/记录时刻，Reviewer
   对旧版本或手工 SQL 形成的坏数据继续 fail closed；到期过滤与稳定排序先解析
   aware datetime，再按绝对时刻比较，不依赖 ISO-8601 TEXT 的字典序；
+- Progress 的 `recorded_at` 不得早于其推进的 revision 已提交 Review 时刻；
+  等价 offset 按绝对时刻比较，非法旧数据在 history、projection 与 Urge 状态
+  发生变化前 fail closed；
 - expired、blocked、satisfied、abandoned 状态均可审计；终态不得重开；
 - Reviewer 只产生普通 Urge，`SLEEP / REFLECT / MESSAGE_PLANNED` 仍由 v0.1
   Engine 与原有门禁决定；
 - `desire-list`、`desire-show` 与 `desire-review --dry-run` 使用只读快照，
   严格校验数据目录、数据库、锁和 WAL/SHM 的类型与私有权限，不修改源内容
-  或元数据；
+  或元数据；复制使用稳定的目录相对文件描述符并在复制前后复核身份与元数据，
+  校验后的路径替换必须 fail closed；
 - v0.2 表与索引在一个显式 SQLite 事务中升级，DDL 中途失败时旧 schema 和
   数据保持完整。
 

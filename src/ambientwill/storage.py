@@ -153,6 +153,18 @@ def _canonical_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
+def _parse_persisted_timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a valid ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed
+
+
 def _reject_symlink_components(path: Path) -> None:
     """Reject any existing symlink in a lexical absolute path."""
     absolute = path.absolute()
@@ -172,11 +184,11 @@ def _validate_snapshot_entry(
     *,
     expect_directory: bool,
     label: str,
-) -> bool:
+) -> os.stat_result | None:
     try:
         metadata = os.lstat(path)
     except FileNotFoundError:
-        return False
+        return None
     expected_type = (
         stat.S_ISDIR(metadata.st_mode)
         if expect_directory
@@ -189,7 +201,126 @@ def _validate_snapshot_entry(
         raise PermissionError(
             f"{label} must not be accessible by group or others: {path}"
         )
-    return True
+    return metadata
+
+
+def _same_snapshot_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _snapshot_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_snapshot_descriptor(
+    descriptor: int,
+    expected: os.stat_result,
+    *,
+    expect_directory: bool,
+    label: str,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    expected_type = (
+        stat.S_ISDIR(metadata.st_mode)
+        if expect_directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if (
+        not expected_type
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or not _same_snapshot_identity(metadata, expected)
+    ):
+        raise OSError(f"{label} changed during snapshot")
+    return metadata
+
+
+def _open_snapshot_entry(
+    directory_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    label: str,
+) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise OSError(f"{label} changed during snapshot") from exc
+    try:
+        _validate_snapshot_descriptor(
+            descriptor,
+            expected,
+            expect_directory=False,
+            label=label,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _assert_snapshot_entry_unchanged(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    fingerprint: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    try:
+        current = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise OSError(f"{label} changed during snapshot") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not _same_snapshot_identity(opened, current)
+        or _snapshot_fingerprint(opened) != fingerprint
+    ):
+        raise OSError(f"{label} changed during snapshot")
+
+
+def _assert_snapshot_entry_absent(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+) -> None:
+    try:
+        os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    raise OSError(f"{label} changed during snapshot")
+
+
+def _copy_snapshot_file(descriptor: int, target: Path) -> None:
+    with (
+        os.fdopen(os.dup(descriptor), "rb") as source,
+        target.open("wb") as destination,
+    ):
+        shutil.copyfileobj(source, destination)
 
 
 class TickLock:
@@ -232,15 +363,22 @@ class TickLock:
 class SnapshotLock:
     """Acquire a shared project lock without creating or modifying lock state."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, descriptor: int | None = None) -> None:
         self.path = path
+        self.descriptor = descriptor
         self._handle = None
 
     def __enter__(self) -> Self:
-        _reject_symlink_components(self.path)
-        if not self.path.exists():
-            return self
-        descriptor = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        if self.descriptor is None:
+            _reject_symlink_components(self.path)
+            if not self.path.exists():
+                return self
+            descriptor = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        else:
+            descriptor = os.dup(self.descriptor)
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             os.close(descriptor)
@@ -278,39 +416,40 @@ class Storage:
 
     @classmethod
     def snapshot(cls, path: str | Path) -> Storage:
-        db_path = Path(path)
+        db_path = Path(path).absolute()
         _reject_symlink_components(db_path)
         lock_path = db_path.parent / "tick.lock"
-        directory_exists = _validate_snapshot_entry(
+        directory_metadata = _validate_snapshot_entry(
             db_path.parent,
             expect_directory=True,
             label="data directory",
         )
-        database_exists = (
+        database_metadata = (
             _validate_snapshot_entry(
                 db_path,
                 expect_directory=False,
                 label="database",
             )
-            if directory_exists
-            else False
+            if directory_metadata is not None
+            else None
         )
-        lock_exists = (
+        lock_metadata = (
             _validate_snapshot_entry(
                 lock_path,
                 expect_directory=False,
                 label="project lock",
             )
-            if directory_exists
-            else False
+            if directory_metadata is not None
+            else None
         )
+        sidecar_metadata: dict[str, os.stat_result | None] = {}
         for suffix in ("-wal", "-shm"):
-            _validate_snapshot_entry(
+            sidecar_metadata[suffix] = _validate_snapshot_entry(
                 Path(f"{db_path}{suffix}"),
                 expect_directory=False,
                 label=f"SQLite {suffix[1:].upper()} sidecar",
             )
-        if database_exists and not lock_exists:
+        if database_metadata is not None and lock_metadata is None:
             raise OSError(
                 f"project lock is missing for existing database: {lock_path}; "
                 "run ambientwill init before read-only inspection"
@@ -319,27 +458,178 @@ class Storage:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
-            with SnapshotLock(lock_path):
-                if database_exists:
-                    with tempfile.TemporaryDirectory(
-                        prefix="ambientwill-snapshot-"
-                    ) as temp:
-                        copied = Path(temp) / db_path.name
-                        shutil.copy2(db_path, copied)
-                        for suffix in ("-wal", "-shm"):
-                            sidecar = Path(f"{db_path}{suffix}")
-                            if sidecar.exists():
-                                shutil.copy2(sidecar, Path(f"{copied}{suffix}"))
-                        source = sqlite3.connect(copied, timeout=1.0)
-                        try:
-                            source.backup(connection)
-                        finally:
-                            source.close()
-                    result = connection.execute("PRAGMA quick_check").fetchone()
-                    if result is None or result[0] != "ok":
-                        raise sqlite3.DatabaseError("snapshot integrity check failed")
-                else:
+            if directory_metadata is None:
+                connection.executescript(SCHEMA)
+                return cls(db_path, read_only=True, memory_connection=connection)
+
+            directory_flags = (
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+            )
+            try:
+                directory_descriptor = os.open(db_path.parent, directory_flags)
+            except OSError as exc:
+                raise OSError("data directory changed during snapshot") from exc
+            try:
+                directory_fingerprint = _snapshot_fingerprint(
+                    _validate_snapshot_descriptor(
+                        directory_descriptor,
+                        directory_metadata,
+                        expect_directory=True,
+                        label="data directory",
+                    )
+                )
+                if database_metadata is None:
+                    _assert_snapshot_entry_absent(
+                        directory_descriptor,
+                        db_path.name,
+                        label="database",
+                    )
                     connection.executescript(SCHEMA)
+                    return cls(
+                        db_path,
+                        read_only=True,
+                        memory_connection=connection,
+                    )
+
+                if lock_metadata is None:
+                    raise OSError(
+                        f"project lock is missing for existing database: {lock_path}"
+                    )
+                lock_descriptor = _open_snapshot_entry(
+                    directory_descriptor,
+                    lock_path.name,
+                    lock_metadata,
+                    label="project lock",
+                )
+                lock_fingerprint = _snapshot_fingerprint(os.fstat(lock_descriptor))
+                try:
+                    with SnapshotLock(
+                        lock_path,
+                        descriptor=lock_descriptor,
+                    ):
+                        database_descriptor = _open_snapshot_entry(
+                            directory_descriptor,
+                            db_path.name,
+                            database_metadata,
+                            label="database",
+                        )
+                        database_fingerprint = _snapshot_fingerprint(
+                            os.fstat(database_descriptor)
+                        )
+                        sidecar_descriptors: dict[str, int] = {}
+                        sidecar_fingerprints: dict[str, tuple[int, ...]] = {}
+                        try:
+                            for suffix, expected in sidecar_metadata.items():
+                                name = f"{db_path.name}{suffix}"
+                                label = f"SQLite {suffix[1:].upper()} sidecar"
+                                if expected is None:
+                                    _assert_snapshot_entry_absent(
+                                        directory_descriptor,
+                                        name,
+                                        label=label,
+                                    )
+                                    continue
+                                descriptor = _open_snapshot_entry(
+                                    directory_descriptor,
+                                    name,
+                                    expected,
+                                    label=label,
+                                )
+                                sidecar_descriptors[suffix] = descriptor
+                                sidecar_fingerprints[suffix] = _snapshot_fingerprint(
+                                    os.fstat(descriptor)
+                                )
+
+                            with tempfile.TemporaryDirectory(
+                                prefix="ambientwill-snapshot-"
+                            ) as temp:
+                                copied = Path(temp) / db_path.name
+                                _copy_snapshot_file(
+                                    database_descriptor,
+                                    copied,
+                                )
+                                for (
+                                    suffix,
+                                    descriptor,
+                                ) in sidecar_descriptors.items():
+                                    _copy_snapshot_file(
+                                        descriptor,
+                                        Path(f"{copied}{suffix}"),
+                                    )
+
+                                _assert_snapshot_entry_unchanged(
+                                    directory_descriptor,
+                                    db_path.name,
+                                    database_descriptor,
+                                    database_fingerprint,
+                                    label="database",
+                                )
+                                _assert_snapshot_entry_unchanged(
+                                    directory_descriptor,
+                                    lock_path.name,
+                                    lock_descriptor,
+                                    lock_fingerprint,
+                                    label="project lock",
+                                )
+                                for (
+                                    suffix,
+                                    descriptor,
+                                ) in sidecar_descriptors.items():
+                                    _assert_snapshot_entry_unchanged(
+                                        directory_descriptor,
+                                        f"{db_path.name}{suffix}",
+                                        descriptor,
+                                        sidecar_fingerprints[suffix],
+                                        label=(f"SQLite {suffix[1:].upper()} sidecar"),
+                                    )
+                                for suffix, expected in sidecar_metadata.items():
+                                    if expected is None:
+                                        _assert_snapshot_entry_absent(
+                                            directory_descriptor,
+                                            f"{db_path.name}{suffix}",
+                                            label=(
+                                                f"SQLite {suffix[1:].upper()} sidecar"
+                                            ),
+                                        )
+                                current_directory = os.fstat(directory_descriptor)
+                                try:
+                                    path_directory = os.lstat(db_path.parent)
+                                except OSError as exc:
+                                    raise OSError(
+                                        "data directory changed during snapshot"
+                                    ) from exc
+                                if (
+                                    not _same_snapshot_identity(
+                                        current_directory,
+                                        path_directory,
+                                    )
+                                    or _snapshot_fingerprint(current_directory)
+                                    != directory_fingerprint
+                                ):
+                                    raise OSError(
+                                        "data directory changed during snapshot"
+                                    )
+
+                                source = sqlite3.connect(
+                                    copied,
+                                    timeout=1.0,
+                                )
+                                try:
+                                    source.backup(connection)
+                                finally:
+                                    source.close()
+                        finally:
+                            os.close(database_descriptor)
+                            for descriptor in sidecar_descriptors.values():
+                                os.close(descriptor)
+                finally:
+                    os.close(lock_descriptor)
+            finally:
+                os.close(directory_descriptor)
+
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            if result is None or result[0] != "ok":
+                raise sqlite3.DatabaseError("snapshot integrity check failed")
         except Exception:
             connection.close()
             raise
@@ -618,6 +908,22 @@ class Storage:
                     < datetime.fromisoformat(previous["recorded_at"])
                 ):
                     raise ValueError("progress time cannot move backwards")
+                review = connection.execute(
+                    """
+                    SELECT evaluated_at FROM desire_reviews
+                    WHERE desire_id = ? AND revision = ?
+                    """,
+                    (progress.desire_id, progress.from_revision),
+                ).fetchone()
+                if review is not None:
+                    reviewed_at = _parse_persisted_timestamp(
+                        review["evaluated_at"],
+                        label="current revision review time",
+                    )
+                    if progress.recorded_at < reviewed_at:
+                        raise ValueError(
+                            "progress cannot predate current revision review"
+                        )
                 connection.execute(
                     """
                     INSERT INTO desire_progress (

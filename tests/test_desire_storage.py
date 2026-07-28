@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ambientwill.desires import DesireReviewer
 from ambientwill.models import Desire, DesireProgress
 from ambientwill.storage import Storage
 
@@ -262,13 +263,14 @@ def make_progress(
     *,
     progress_id: str = "progress-1",
     from_revision: int = 1,
+    recorded_at: datetime = NOW + timedelta(minutes=30),
     status: str = "open",
     next_review_at: datetime | None = NOW + timedelta(hours=2),
 ) -> DesireProgress:
     return DesireProgress(
         id=progress_id,
         desire_id="desire-1",
-        recorded_at=NOW + timedelta(minutes=30),
+        recorded_at=recorded_at,
         from_revision=from_revision,
         to_revision=from_revision + 1,
         current_state="The checkpoint is in progress.",
@@ -340,6 +342,97 @@ def test_progress_failure_after_history_rolls_back_projection_and_history(
     details = store.desire_details("desire-1")
     assert details["desire"]["revision"] == 1
     assert details["progress"] == []
+
+
+def test_progress_cannot_be_backfilled_before_current_revision_review(
+    store: Storage, policy
+) -> None:
+    review_at = NOW + timedelta(hours=1)
+    store.add_desire(make_desire())
+    DesireReviewer(policy, store).review(at=review_at)
+    before = store.desire_details("desire-1")
+
+    with pytest.raises(ValueError, match="predate current revision review"):
+        store.record_desire_progress(
+            make_progress(recorded_at=review_at - timedelta(microseconds=1))
+        )
+
+    assert store.desire_details("desire-1") == before
+    assert len(store.valid_urges(review_at)) == 1
+
+
+def test_progress_at_current_revision_review_boundary_is_allowed(
+    store: Storage, policy
+) -> None:
+    review_at = NOW + timedelta(hours=1)
+    store.add_desire(make_desire())
+    DesireReviewer(policy, store).review(at=review_at)
+
+    updated = store.record_desire_progress(
+        make_progress(recorded_at=review_at, next_review_at=review_at)
+    )
+
+    assert updated.revision == 2
+    assert store.desire_details("desire-1")["progress"][0]["recorded_at"] == (
+        review_at.isoformat()
+    )
+
+
+def test_progress_backfill_compares_review_offsets_as_absolute_instants(
+    store: Storage, policy
+) -> None:
+    review_at = NOW + timedelta(hours=1)
+    store.add_desire(make_desire())
+    DesireReviewer(policy, store).review(at=review_at)
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desire_reviews SET evaluated_at = ?
+            WHERE desire_id = 'desire-1' AND revision = 1
+            """,
+            ("2026-02-01T14:00:00+01:00",),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="predate current revision review"):
+        store.record_desire_progress(
+            make_progress(recorded_at=review_at - timedelta(microseconds=1))
+        )
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_progress").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT status FROM urges").fetchone()[0] == "open"
+    assert store.get_desire("desire-1").revision == 1
+
+
+def test_invalid_current_revision_review_time_blocks_progress_atomically(
+    store: Storage, policy
+) -> None:
+    review_at = NOW + timedelta(hours=1)
+    store.add_desire(make_desire())
+    DesireReviewer(policy, store).review(at=review_at)
+    with store.connect() as connection:
+        connection.execute(
+            """
+            UPDATE desire_reviews SET evaluated_at = 'invalid'
+            WHERE desire_id = 'desire-1' AND revision = 1
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError):
+        store.record_desire_progress(make_progress(recorded_at=review_at))
+
+    with store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM desire_progress").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT status FROM urges").fetchone()[0] == "open"
+    assert store.get_desire("desire-1").revision == 1
 
 
 @pytest.mark.parametrize("terminal", ["satisfied", "abandoned", "expired"])

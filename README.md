@@ -152,6 +152,11 @@ Each Desire review:
 6. stores structured Desire/revision provenance for generated Urges and
    expires every older linked open Urge when new Progress is recorded.
 
+Progress timestamps cannot be backfilled before the committed Review of the
+revision they advance. Equal instants are allowed, including equivalent
+timezone-offset representations; malformed legacy Review timestamps fail
+closed before history, projection, or Urge state changes.
+
 The reviewer never calls the Engine. A normal Tick consumes the resulting Urge
 through the unchanged v0.1 gates, budgets, jitter, WakeEvent, and shadow Outbox.
 
@@ -180,7 +185,9 @@ project lock use `0600`. Writable operations refuse database or directory
 symlinks and refuse existing data directories that are accessible by group or
 others. Read-only commands require private modes and regular-file types for the
 data directory, database, lock, and present WAL/SHM files, then copy the state
-into an in-memory snapshot without repairing or modifying the source. v0.2
+through stable directory-relative file descriptors into an in-memory snapshot.
+Identity and metadata are checked before and after copying, so path replacement
+fails closed without repairing or modifying the source. v0.2
 schema initialization is one explicit SQLite transaction, so an interrupted
 upgrade preserves the complete v0.1 schema and data.
 
