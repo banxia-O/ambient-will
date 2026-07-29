@@ -31,6 +31,13 @@ entire v0.2 installation without changing the host.
 - Python 3.11 or newer
 - no runtime dependencies outside the Python standard library
 
+## Hermes wake/composition boundary
+
+Real-user testing established that AmbientWill must wake the host Agent rather
+than speak through an adapter template. The minimal, delivery-agnostic boundary
+and regression helper live in [`integrations/hermes/`](integrations/hermes/README.md).
+The v0.2 core remains offline and unchanged.
+
 ## Quick start
 
 Create a local configuration and SQLite ledger:
