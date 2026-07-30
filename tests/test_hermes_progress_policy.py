@@ -4,7 +4,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from integrations.hermes.progress_policy import propose_progress
+from integrations.hermes.progress_policy import (
+    progress_id_for_event,
+    propose_progress,
+)
 
 NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 
@@ -44,6 +47,7 @@ def test_sent_proposes_future_open_progress() -> None:
     )
 
     assert proposal is not None
+    assert proposal.progress_id == progress_id_for_event("event-4")
     assert proposal.expected_revision == 4
     assert proposal.recorded_at == "2026-03-01T12:00:00.000000+00:00"
     assert proposal.current_state == "A recurring private goal remains active."
@@ -53,6 +57,22 @@ def test_sent_proposes_future_open_progress() -> None:
     assert proposal.next_review_at == "2026-03-01T18:00:00.000000+00:00"
     assert proposal.status == "open"
     assert proposal.note == "outcome=sent"
+
+
+def test_progress_id_is_stable_and_event_specific() -> None:
+    first = progress_id_for_event("event-4")
+
+    assert first == progress_id_for_event("event-4")
+    assert first != progress_id_for_event("event-5")
+    assert first.startswith("aw_rearm_")
+    assert len(first) == len("aw_rearm_") + 64
+    assert all(character in "0123456789abcdef" for character in first[9:])
+
+
+@pytest.mark.parametrize("event_id", ["", "   ", None, 4])
+def test_progress_id_rejects_invalid_event_id(event_id: object) -> None:
+    with pytest.raises(ValueError):
+        progress_id_for_event(event_id)
 
 
 @pytest.mark.parametrize("outcome", ["suppressed", "delivery_unknown"])

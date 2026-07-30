@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ DESIRE_STATUSES = frozenset({"open", "blocked", "satisfied", "abandoned", "expir
 
 @dataclass(frozen=True)
 class ProgressProposal:
+    progress_id: str
     expected_revision: int
     recorded_at: str
     current_state: str
@@ -27,6 +29,14 @@ class ProgressProposal:
 
 def _timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def progress_id_for_event(event_id: object) -> str:
+    """Derive a stable, opaque Progress ID from one receipt event ID."""
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("event_id must be a non-empty string")
+    digest = hashlib.sha256(event_id.strip().encode("utf-8")).hexdigest()
+    return f"aw_rearm_{digest}"
 
 
 def _field(item: Mapping[str, object], name: str) -> object:
@@ -98,7 +108,7 @@ def propose_progress(
         name="actionability",
     )
 
-    _text(receipt, "event_id")
+    event_id = _text(receipt, "event_id")
     receipt_desire_id = _text(receipt, "desire_id")
     receipt_revision = _revision(
         _field(receipt, "desire_revision"),
@@ -133,6 +143,7 @@ def propose_progress(
     except OverflowError as exc:
         raise ValueError("rearm interval exceeds datetime range") from exc
     return ProgressProposal(
+        progress_id=progress_id_for_event(event_id),
         expected_revision=desire_revision,
         recorded_at=_timestamp(evaluated_at),
         current_state=current_state,

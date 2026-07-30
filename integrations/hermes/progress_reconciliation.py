@@ -10,12 +10,14 @@ from integrations.hermes.progress_policy import (
     NONTERMINAL_RECEIPT_STATUSES,
     TERMINAL_RECEIPT_STATUSES,
     ProgressProposal,
+    progress_id_for_event,
     propose_progress,
 )
 
 ReadDesire = Callable[[str], Mapping[str, object] | None]
+ReadProgress = Callable[[str], Mapping[str, object] | None]
 AppendProgress = Callable[[str, str, ProgressProposal], int]
-UpdateReceipt = Callable[[str, int], None]
+UpdateReceipt = Callable[[str, int], bool]
 
 
 class RevisionConflictError(RuntimeError):
@@ -41,6 +43,23 @@ def _revision(value: object, *, name: str) -> int:
     return value
 
 
+def _matches_progress_provenance(
+    progress: Mapping[str, object],
+    *,
+    progress_id: str,
+    desire_id: str,
+    from_revision: int,
+) -> bool:
+    return (
+        progress.get("id") == progress_id
+        and progress.get("desire_id") == desire_id
+        and type(progress.get("from_revision")) is int
+        and progress.get("from_revision") == from_revision
+        and type(progress.get("to_revision")) is int
+        and progress.get("to_revision") == from_revision + 1
+    )
+
+
 def reconcile_receipt(
     *,
     receipt: Mapping[str, object],
@@ -48,10 +67,18 @@ def reconcile_receipt(
     evaluated_at: datetime,
     rearm_after: timedelta,
     read_desire: ReadDesire,
+    read_progress: ReadProgress,
     append_progress: AppendProgress,
     update_receipt: UpdateReceipt,
 ) -> ReconciliationResult:
     """Reconcile one receipt without owning any storage or delivery I/O."""
+    if not isinstance(recurring_desire_ids, frozenset) or any(
+        not isinstance(desire_id, str) or not desire_id.strip()
+        for desire_id in recurring_desire_ids
+    ):
+        raise ValueError(
+            "recurring_desire_ids must be a frozenset of non-empty strings"
+        )
     event_id = _text(receipt, "event_id")
     desire_id = _text(receipt, "desire_id")
     receipt_revision = _revision(
@@ -88,7 +115,17 @@ def reconcile_receipt(
     if current.get("status") != "open":
         return ReconciliationResult("not_eligible")
     if current_revision == receipt_revision + 1:
-        update_receipt(event_id, current_revision)
+        expected_progress_id = progress_id_for_event(event_id)
+        progress = read_progress(expected_progress_id)
+        if not isinstance(progress, Mapping) or not _matches_progress_provenance(
+            progress,
+            progress_id=expected_progress_id,
+            desire_id=desire_id,
+            from_revision=receipt_revision,
+        ):
+            return ReconciliationResult("conflict")
+        if update_receipt(event_id, current_revision) is not True:
+            return ReconciliationResult("conflict")
         return ReconciliationResult("receipt_marked", current_revision)
     if current_revision != receipt_revision:
         return ReconciliationResult("conflict")
@@ -108,5 +145,6 @@ def reconcile_receipt(
     expected_new_revision = proposal.expected_revision + 1
     if type(progress_revision) is not int or progress_revision != expected_new_revision:
         raise ValueError("append_progress returned an unexpected revision")
-    update_receipt(event_id, progress_revision)
+    if update_receipt(event_id, progress_revision) is not True:
+        return ReconciliationResult("conflict")
     return ReconciliationResult("progress_appended", progress_revision)

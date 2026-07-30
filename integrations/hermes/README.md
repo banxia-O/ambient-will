@@ -45,16 +45,27 @@ fail closed.
 
 ```text
 read_desire(desire_id)
+read_progress(progress_id)
 append_progress(desire_id, event_id, proposal) -> new_revision
-update_receipt(event_id, progress_revision)
+update_receipt(event_id, progress_revision) -> bool
 ```
 
 `append_progress` must enforce `proposal.expected_revision` as an optimistic
-compare-and-swap and translate a real CAS miss to `RevisionConflictError`.
+compare-and-swap and translate a real CAS miss to `RevisionConflictError`. It
+must persist `proposal.progress_id` unchanged. That ID is derived
+deterministically as `aw_rearm_<sha256(event_id)>`, so recovery can ask
+`read_progress` for the one Progress owned by that receipt.
+
 After a successful append, the adapter stores the returned revision on the
-receipt. If the process stops between those operations, a later call observes
-exactly `desire_revision + 1` and repairs only the receipt marker. Any other
-revision drift fails closed.
+receipt. `update_receipt` is a receipt-identity-aware compare-and-swap: an empty
+marker may be set, the same marker is idempotent success, and a different
+marker, missing receipt, or changed receipt identity returns `False`.
+
+If the process stops between those operations, a later call repairs only the
+receipt marker after `read_progress` returns a record whose `id`, `desire_id`,
+`from_revision`, and `to_revision` exactly match the expected transition. An
+adjacent Desire revision without that provenance may belong to unrelated work
+and therefore fails closed. Any other revision drift also fails closed.
 
 These helpers do not open files, invoke the CLI, call Hermes, schedule work, or
 deliver messages. Production code still owns its receipt schema, transaction
