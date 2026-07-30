@@ -36,7 +36,10 @@ entire v0.2 installation without changing the host.
 Real-user testing established that AmbientWill must wake the host Agent rather
 than speak through an adapter template. The minimal, delivery-agnostic boundary
 and regression helper live in [`integrations/hermes/`](integrations/hermes/README.md).
-The v0.2 core remains offline and unchanged.
+That directory also contains a pure, dependency-injected policy reference for
+turning terminal receipts into future Progress on explicitly allowlisted
+recurring Desires. It performs no I/O or delivery, and `delivery_unknown` never
+retries the original event. The v0.2 core remains an offline shadow simulator.
 
 ## Quick start
 
@@ -227,7 +230,7 @@ python -m venv .venv
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
-.venv/bin/python -m compileall -q src tests
+.venv/bin/python -m compileall -q src integrations tests
 .venv/bin/python -m build
 .venv/bin/python -m twine check dist/*
 ```
